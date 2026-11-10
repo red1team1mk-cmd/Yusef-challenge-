@@ -2,18 +2,21 @@
 """
 IRAQ AIR TRAFFIC MONITOR
 ========================
-Telegram bot (long polling) + AirNav Radar On Demand API v2 + SQLite.
-Designed to run as a single Railway worker service (no HTTP port).
+Telegram bot (long polling) + free community ADS-B feeds + SQLite.
+Designed to run as a single Railway worker service (no HTTP port, no API key).
 
-API reference used for every endpoint / field in this file:
-    https://www.airnavradar.com/api/openapi   (AirNav On Demand API v2.4.x)
-      Base URL : https://api.airnavradar.com/v2
-      Auth     : Authorization: Bearer <token>
-      POST /flights/live        (bounding box, no pagination)
-      POST /flights/geosearch   (bounding box + fromDate/toDate, page/pageSize,
-                                 includeFlightPaths -> positions[])
-      GET  /aircraft            (modeS | registration)
-      GET  /billing/status      (availableCredit / usedCredit)
+Data sources (tried in the order given by ADSB_PROVIDERS):
+    adsb.fi         https://github.com/adsbfi/opendata  (official README)
+                    GET /api/v3/lat/{lat}/lon/{lon}/dist/{nm}, max 250 NM,
+                    1 request/second, personal non-commercial use, attribution.
+    adsb.lol        https://github.com/adsblol/api  (ADSBExchange-v2 compatible)
+    airplanes.live  https://airplanes.live/api-guide/
+All three return readsb-style aircraft objects (hex, flight, r, t, desc,
+alt_baro, gs, track, baro_rate, lat, lon, seen_pos, dbFlags, ownOp).
+
+These feeds carry live positions only: no origin/destination airports, no
+schedule times and no historical query.  Those fields are shown as N/A and the
+archive is whatever this bot has collected itself.
 
 Crossing evidence policy
 ------------------------
@@ -21,7 +24,6 @@ A flight is stored only if at least one airborne position observation lies
 inside the Iraq boundary polygon.  It is labelled CONFIRMED only when two or
 more such observations at least 60 s apart exist.  A single observation is
 labelled SINGLE_OBS and is never counted as a crossing in statistics.
-Airport origin/destination alone is never used as evidence.
 """
 from __future__ import annotations
 
@@ -35,6 +37,7 @@ import logging
 import os
 import platform
 import random
+import re
 import signal
 import sqlite3
 import sys
@@ -72,9 +75,21 @@ except Exception:  # pragma: no cover
 # --------------------------------------------------------------------------
 # CONSTANTS
 # --------------------------------------------------------------------------
-API_BASE = "https://api.airnavradar.com/v2"
+# provider id -> (display name, home page, URL template)
+PROVIDERS = {
+    "adsbfi": ("adsb.fi", "https://adsb.fi",
+               "https://opendata.adsb.fi/api/v3/lat/{lat}/lon/{lon}/dist/{dist}"),
+    "adsblol": ("adsb.lol", "https://adsb.lol",
+                "https://api.adsb.lol/v2/lat/{lat}/lon/{lon}/dist/{dist}"),
+    "airplaneslive": ("airplanes.live", "https://airplanes.live",
+                      "https://api.airplanes.live/v2/point/{lat}/{lon}/{dist}"),
+}
+# Three 250 NM circles (the maximum radius the feeds allow) that together cover Iraq.
+QUERY_RADIUS_NM = 250
+QUERY_CIRCLES = [(33.0, 41.6), (35.2, 44.6), (31.2, 46.0)]
+MAX_POSITION_AGE = 60  # seconds; older positions are ignored as stale
 APP_NAME = "IRAQ AIR TRAFFIC MONITOR"
-APP_VERSION = "1.0.0"
+APP_VERSION = "2.0.0"
 
 # Simplified Iraq land-boundary polygon (lon, lat), clockwise from the
 # Turkey/Syria/Iraq tripoint.  Accuracy is roughly 10-20 km: flights that only
@@ -99,9 +114,6 @@ BBOX = {
 SAME_CROSSING_GAP = timedelta(hours=3)   # same aircraft+callsign within gap = same crossing
 CONFIRM_MIN_SECONDS = 60                 # min spread between observations to confirm
 PAGE_SIZE = 8                            # flights per Telegram list page
-GEO_PAGE_SIZE = 100                      # geosearch pageSize
-GEO_MAX_PAGES = 50                       # safety cap per backfill chunk
-BACKFILL_CHUNK = timedelta(hours=6)
 NOT_AIRBORNE = {"ON_GROUND", "LANDED", "SCHEDULED", "CANCELLED"}
 NA = "N/A"
 SEP = "━" * 28
@@ -155,11 +167,14 @@ class Config:
     def __init__(self) -> None:
         errors: list[str] = []
         self.bot_token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-        self.api_key = os.getenv("AIRNAV_API_KEY", "").strip()
         if not self.bot_token:
             errors.append("TELEGRAM_BOT_TOKEN is missing")
-        if not self.api_key:
-            errors.append("AIRNAV_API_KEY is missing")
+        raw = os.getenv("ADSB_PROVIDERS", "").strip() or "adsbfi,adsblol,airplaneslive"
+        self.providers = [x.strip().lower() for x in raw.split(",") if x.strip()]
+        for name in self.providers:
+            if name not in PROVIDERS:
+                errors.append(f"ADSB_PROVIDERS: unknown provider {name!r} "
+                              f"(valid: {', '.join(PROVIDERS)})")
 
         self.admin_ids: set[int] = set()
         for part in os.getenv("ADMIN_IDS", "").replace(";", ",").split(","):
@@ -182,8 +197,6 @@ class Config:
         self.tz_name = tz_name
 
         # Optional tuning (all have safe defaults)
-        self.daily_credit_budget = self._int("DAILY_CREDIT_BUDGET", 0, 0, errors)
-        self.backfill_on_start = os.getenv("BACKFILL_ON_START", "true").lower() in ("1", "true", "yes")
         self.track_retention_days = self._int("TRACK_RETENTION_DAYS", 90, 0, errors)
 
         if errors:
@@ -295,13 +308,9 @@ def point_in_iraq(lat: float, lon: float) -> bool:
 
 
 # --------------------------------------------------------------------------
-# AIRNAV RADAR API CLIENT
+# ADS-B FEED CLIENT
 # --------------------------------------------------------------------------
 class ApiError(Exception):
-    pass
-
-
-class ApiAuthError(ApiError):
     pass
 
 
@@ -309,32 +318,30 @@ class ApiRateLimited(ApiError):
     pass
 
 
-class AirNavClient:
-    MAX_ATTEMPTS = 4
-    MIN_REQUEST_GAP = 1.0  # seconds between any two requests
+AIRLINE_CALLSIGN = re.compile(r"^[A-Z]{3}[0-9]")
 
-    def __init__(self, api_key: str) -> None:
+
+class AdsbClient:
+    MAX_ATTEMPTS = 3
+    MIN_REQUEST_GAP = 1.2  # feeds allow 1 request/second; stay under it
+
+    def __init__(self, providers: list[str]) -> None:
+        self.providers = providers
         self._client = httpx.AsyncClient(
-            base_url=API_BASE,
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Accept": "application/json",
-                "User-Agent": f"iraq-air-traffic-monitor/{APP_VERSION}",
-            },
-            timeout=httpx.Timeout(30.0, connect=10.0),
-        )
+            headers={"Accept": "application/json",
+                     "User-Agent": f"iraq-air-traffic-monitor/{APP_VERSION}"},
+            timeout=httpx.Timeout(25.0, connect=10.0), follow_redirects=True)
         self._gate = asyncio.Lock()
         self._last_request = 0.0
-        self._cache: dict[str, tuple[float, Any]] = {}
         self.last_ok: Optional[datetime] = None
         self.last_error: Optional[str] = None
         self.last_latency_ms: Optional[int] = None
+        self.last_provider: Optional[str] = None
 
     async def close(self) -> None:
         await self._client.aclose()
 
-    async def _request(self, method: str, path: str, *, params: Optional[dict] = None,
-                       body: Optional[dict] = None) -> dict:
+    async def _get(self, url: str) -> dict:
         last_exc: Exception = ApiError("no attempt made")
         for attempt in range(1, self.MAX_ATTEMPTS + 1):
             async with self._gate:
@@ -343,116 +350,124 @@ class AirNavClient:
                     await asyncio.sleep(wait)
                 started = time.monotonic()
                 try:
-                    resp = await self._client.request(method, path, params=params, json=body)
+                    resp = await self._client.get(url)
                 except (httpx.TimeoutException, httpx.TransportError) as exc:
                     resp = None
                     last_exc = ApiError(f"network error: {type(exc).__name__}")
                 finally:
                     self._last_request = time.monotonic()
-            delay = min(60.0, 2.0 ** attempt) + random.uniform(0, 1)
+            delay = min(30.0, 2.0 ** attempt) + random.uniform(0, 1)
             if resp is not None:
                 self.last_latency_ms = int((time.monotonic() - started) * 1000)
-                if resp.status_code in (401, 403):
-                    self.last_error = f"authentication/authorization failed (HTTP {resp.status_code})"
-                    raise ApiAuthError(self.last_error)
                 if resp.status_code == 429:
                     last_exc = ApiRateLimited("rate limited (HTTP 429)")
                     retry_after = resp.headers.get("Retry-After", "")
                     if retry_after.isdigit():
-                        delay = min(120.0, float(retry_after))
+                        delay = min(60.0, float(retry_after))
                 elif resp.status_code >= 500:
                     last_exc = ApiError(f"server error (HTTP {resp.status_code})")
                 elif resp.status_code >= 400:
-                    self.last_error = f"request rejected (HTTP {resp.status_code})"
-                    raise ApiError(self.last_error)
+                    # 4xx means the request itself is refused: do not hammer the feed.
+                    raise ApiError(f"request refused (HTTP {resp.status_code})")
                 else:
                     try:
                         data = resp.json()
                     except ValueError:
-                        self.last_error = "invalid JSON in API response"
-                        raise ApiError(self.last_error)
+                        raise ApiError("invalid JSON in feed response")
                     if not isinstance(data, dict):
-                        self.last_error = "unexpected API response shape"
-                        raise ApiError(self.last_error)
-                    if data.get("success") is False:
-                        comment = clean_str(data.get("comment")) or "no reason given"
-                        self.last_error = f"API reported failure: {comment[:200]}"
-                        raise ApiError(self.last_error)
-                    self.last_ok = now_utc()
-                    self.last_error = None
+                        raise ApiError("unexpected feed response shape")
                     return data
             if attempt < self.MAX_ATTEMPTS:
-                log.warning("api retry", extra={"data": {
-                    "path": path, "attempt": attempt, "delay": round(delay, 1), "reason": str(last_exc)}})
+                log.warning("feed retry", extra={"data": {
+                    "attempt": attempt, "delay": round(delay, 1), "reason": str(last_exc)}})
                 await asyncio.sleep(delay)
-        self.last_error = str(last_exc)
         raise last_exc
 
     @staticmethod
-    def _flights(data: dict) -> list[dict]:
-        flights = data.get("flights")
-        if flights is None:
-            return []
-        if not isinstance(flights, list):
-            raise ApiError("'flights' is not a list in API response")
-        return [f for f in flights if isinstance(f, dict)]
+    def normalize(ac: dict, feed_now: datetime, provider: str) -> Optional[dict]:
+        """Convert one readsb aircraft object to the record shape Database.ingest expects.
+        Returns None when there is no fresh position."""
+        lat, lon = clean_num(ac.get("lat")), clean_num(ac.get("lon"))
+        if lat is None or lon is None:
+            return None
+        age = clean_num(ac.get("seen_pos"))
+        if age is None:
+            age = clean_num(ac.get("seen")) or 0.0
+        if age > MAX_POSITION_AGE:
+            return None
+        baro = ac.get("alt_baro")
+        on_ground = isinstance(baro, str) and baro.strip().lower() == "ground"
+        altitude = 0.0 if on_ground else clean_num(baro)
+        if altitude is None:
+            altitude = clean_num(ac.get("alt_geom"))
+        callsign = (clean_str(ac.get("flight")) or "").upper() or None
+        hex_code = (clean_str(ac.get("hex")) or "").upper() or None
+        flags = clean_num(ac.get("dbFlags"))
+        rate = clean_num(ac.get("baro_rate"))
+        return {
+            "callsign": callsign,
+            "aircraftModeS": hex_code,
+            "aircraftRegistration": clean_str(ac.get("r")),
+            "aircraftType": clean_str(ac.get("t")),
+            "aircraftTypeDescription": clean_str(ac.get("desc")),
+            # ICAO convention: airline callsigns start with the 3-letter operator
+            # designator.  This is an inference from the callsign, not feed data.
+            "airlineIcao": callsign[:3] if callsign and AIRLINE_CALLSIGN.match(callsign) else None,
+            "aircraftClasses": ["MILITARY"] if flags is not None and int(flags) & 1 else None,
+            "ownerOperator": clean_str(ac.get("ownOp")),
+            "latitude": lat, "longitude": lon, "altitude": altitude,
+            "groundSpeed": clean_num(ac.get("gs")), "heading": clean_num(ac.get("track")),
+            "verticalRate": rate if rate is not None else clean_num(ac.get("geom_rate")),
+            "status": "ON_GROUND" if on_ground else "IN_FLIGHT",
+            "updated": iso(feed_now - timedelta(seconds=max(0.0, age))),
+            "source": provider,
+        }
 
-    async def live_flights(self) -> tuple[list[dict], int]:
-        """POST /flights/live restricted to the Iraq bounding box."""
-        data = await self._request("POST", "/flights/live", body=dict(BBOX))
-        return self._flights(data), int(clean_num(data.get("cost")) or 0)
+    async def _snapshot_from(self, provider: str) -> list[dict]:
+        template = PROVIDERS[provider][2]
+        merged: dict[str, dict] = {}
+        for lat, lon in QUERY_CIRCLES:
+            data = await self._get(template.format(lat=lat, lon=lon, dist=QUERY_RADIUS_NM))
+            aircraft = data.get("ac")
+            if aircraft is None:
+                aircraft = data.get("aircraft")
+            if aircraft is None:
+                aircraft = []
+            if not isinstance(aircraft, list):
+                raise ApiError("aircraft list missing in feed response")
+            feed_now = parse_dt(data.get("now")) or now_utc()
+            if abs((feed_now - now_utc()).total_seconds()) > 120:
+                feed_now = now_utc()
+            for ac in aircraft:
+                if not isinstance(ac, dict):
+                    continue
+                try:
+                    record = self.normalize(ac, feed_now, provider)
+                except Exception:
+                    record = None
+                if not record:
+                    continue
+                key = record["aircraftModeS"] or record["aircraftRegistration"] or record["callsign"]
+                if key and (key not in merged or record["updated"] > merged[key]["updated"]):
+                    merged[key] = record
+        return list(merged.values())
 
-    async def geosearch(self, start: datetime, end: datetime) -> tuple[list[dict], int, bool]:
-        """POST /flights/geosearch with flight paths, all pages. Returns
-        (flights, credits, truncated)."""
-        flights: list[dict] = []
-        credits = 0
-        page = 1
-        truncated = False
-        while True:
-            body = dict(BBOX)
-            body.update({
-                "fromDate": iso(start), "toDate": iso(end),
-                "includeFlightPaths": True, "page": page, "pageSize": GEO_PAGE_SIZE,
-            })
-            data = await self._request(
-                "POST", "/flights/geosearch",
-                params={"page": page, "pageSize": GEO_PAGE_SIZE}, body=body)
-            batch = self._flights(data)
-            flights.extend(batch)
-            credits += int(clean_num(data.get("cost")) or 0)
-            # The spec spells this field "totaPages"; accept the corrected spelling too.
-            total_pages = clean_num(data.get("totaPages"))
-            if total_pages is None:
-                total_pages = clean_num(data.get("totalPages"))
-            if not batch:
-                break
-            if total_pages is not None:
-                if page >= int(total_pages):
-                    break
-            elif len(batch) < GEO_PAGE_SIZE:
-                break
-            if page >= GEO_MAX_PAGES:
-                truncated = True
-                break
-            page += 1
-        return flights, credits, truncated
-
-    async def aircraft(self, mode_s: Optional[str], registration: Optional[str]) -> Optional[dict]:
-        """GET /aircraft by Mode-S hex or registration."""
-        params = {"modeS": mode_s} if mode_s else {"registration": registration}
-        data = await self._request("GET", "/aircraft", params=params)
-        aircraft = data.get("aircraft")
-        return aircraft if isinstance(aircraft, dict) else None
-
-    async def billing_status(self, max_age: float = 300.0) -> dict:
-        """GET /billing/status, cached in memory."""
-        hit = self._cache.get("billing")
-        if hit and time.monotonic() - hit[0] < max_age:
-            return hit[1]
-        data = await self._request("GET", "/billing/status")
-        self._cache["billing"] = (time.monotonic(), data)
-        return data
+    async def snapshot(self) -> tuple[list[dict], str]:
+        """Current aircraft around Iraq from the first provider that answers."""
+        errors: list[str] = []
+        for provider in self.providers:
+            try:
+                flights = await self._snapshot_from(provider)
+            except ApiError as exc:
+                errors.append(f"{PROVIDERS[provider][0]}: {exc}")
+                log.warning("feed failed", extra={"data": {"provider": provider, "error": str(exc)}})
+                continue
+            self.last_ok, self.last_error, self.last_provider = now_utc(), None, provider
+            return flights, provider
+        self.last_error = "; ".join(errors)[:300]
+        if errors and all("429" in e for e in errors):
+            raise ApiRateLimited(self.last_error)
+        raise ApiError(self.last_error)
 
 
 # --------------------------------------------------------------------------
@@ -524,7 +539,7 @@ CREATE TABLE IF NOT EXISTS sync_history (
     status TEXT NOT NULL,
     received INTEGER DEFAULT 0, in_iraq INTEGER DEFAULT 0,
     inserted INTEGER DEFAULT 0, updated INTEGER DEFAULT 0, skipped INTEGER DEFAULT 0,
-    credits INTEGER DEFAULT 0, detail TEXT
+    detail TEXT
 );
 CREATE INDEX IF NOT EXISTS ix_sync_started ON sync_history(started_utc);
 
@@ -538,7 +553,8 @@ CREATE TABLE IF NOT EXISTS runs (
 );
 """
 
-# db column -> ApiFlight field (https://www.airnavradar.com/api/openapi, schema ApiFlight)
+# db column -> normalized record field (see AdsbClient.normalize). Airport and time
+# fields are kept in the schema but the ADS-B feeds do not provide them.
 FLIGHT_TEXT_FIELDS = {
     "callsign": "callsign",
     "flight_number_iata": "flightNumberIata",
@@ -807,9 +823,11 @@ class Database:
                 "operator_name, first_seen_utc, last_seen_utc) VALUES(?,?,?,?,?,?,?,?,?) "
                 "ON CONFLICT(key) DO UPDATE SET registration=COALESCE(excluded.registration, registration), "
                 "mode_s=COALESCE(excluded.mode_s, mode_s), type_icao=COALESCE(excluded.type_icao, type_icao), "
-                "type_desc=COALESCE(excluded.type_desc, type_desc), last_seen_utc=excluded.last_seen_utc",
+                "type_desc=COALESCE(excluded.type_desc, type_desc), "
+                "operator_name=COALESCE(excluded.operator_name, operator_name), "
+                "last_seen_utc=excluded.last_seen_utc",
                 (ac_key, fields["registration"], fields["mode_s"], fields["aircraft_type"],
-                 fields["aircraft_type_desc"], fields["airline_icao"], fields["airline_name"],
+                 fields["aircraft_type_desc"], None, clean_str(raw.get("ownerOperator")),
                  stamp, stamp))
         return outcome
 
@@ -818,25 +836,18 @@ class Database:
 # SYNCHRONISATION SERVICE
 # --------------------------------------------------------------------------
 class SyncService:
-    def __init__(self, cfg: Config, db: Database, api: AirNavClient) -> None:
+    def __init__(self, cfg: Config, db: Database, api: AdsbClient) -> None:
         self.cfg, self.db, self.api = cfg, db, api
         self.lock = asyncio.Lock()
         self.stop = asyncio.Event()
         self.next_run: Optional[datetime] = None
-        self.auth_block_until: Optional[datetime] = None
         self.cycles = 0
 
-    async def credits_today(self) -> int:
-        midnight = now_utc().replace(hour=0, minute=0, second=0)
-        return int(await self.db.scalar(
-            "SELECT COALESCE(SUM(credits),0) FROM sync_history WHERE started_utc>=?",
-            (iso(midnight),)) or 0)
-
-    async def _record(self, kind: str, trigger: str, started: datetime, status: str,
-                      res: Optional[dict] = None, credits: int = 0, detail: str = "") -> dict:
+    async def _record(self, trigger: str, started: datetime, status: str,
+                      res: Optional[dict] = None, detail: str = "") -> dict:
         res = res or {}
         row = {
-            "kind": kind, "trigger": trigger, "status": status, "credits": credits,
+            "kind": "LIVE", "trigger": trigger, "status": status,
             "received": res.get("received", 0), "in_iraq": res.get("in_iraq", 0),
             "inserted": res.get("inserted", 0), "updated": res.get("updated", 0),
             "skipped": res.get("skipped", 0) + res.get("no_evidence", 0), "detail": detail[:500],
@@ -844,93 +855,34 @@ class SyncService:
         try:
             await self.db.run(
                 "INSERT INTO sync_history(kind, trigger, started_utc, finished_utc, status, received, "
-                "in_iraq, inserted, updated, skipped, credits, detail) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-                (kind, trigger, iso(started), iso(now_utc()), status, row["received"], row["in_iraq"],
-                 row["inserted"], row["updated"], row["skipped"], credits, row["detail"]))
+                "in_iraq, inserted, updated, skipped, detail) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                ("LIVE", trigger, iso(started), iso(now_utc()), status, row["received"], row["in_iraq"],
+                 row["inserted"], row["updated"], row["skipped"], row["detail"]))
         except Exception:
             log.exception("could not record sync result")
         ev("sync finished", **row)
         return row
 
-    async def _budget_block(self) -> Optional[str]:
-        budget = self.cfg.daily_credit_budget
-        if budget > 0:
-            used = await self.credits_today()
-            if used >= budget:
-                return f"daily credit budget reached ({used}/{budget})"
-        return None
-
     async def sync_live(self, trigger: str = "auto") -> dict:
         async with self.lock:
             started = now_utc()
-            blocked = await self._budget_block()
-            if blocked:
-                return await self._record("LIVE", trigger, started, "SKIPPED", detail=blocked)
             try:
-                flights, credits = await self.api.live_flights()
-            except ApiAuthError as exc:
-                self.auth_block_until = now_utc() + timedelta(minutes=30)
-                await self.db.set_status("live_access", f"DENIED: {exc}")
-                return await self._record("LIVE", trigger, started, "AUTH_ERROR", detail=str(exc))
+                flights, provider = await self.api.snapshot()
             except ApiRateLimited as exc:
-                return await self._record("LIVE", trigger, started, "RATE_LIMITED", detail=str(exc))
+                await self.db.set_status("live_access", "RATE LIMITED")
+                return await self._record(trigger, started, "RATE_LIMITED", detail=str(exc))
             except ApiError as exc:
-                return await self._record("LIVE", trigger, started, "API_ERROR", detail=str(exc))
+                await self.db.set_status("live_access", "UNAVAILABLE")
+                return await self._record(trigger, started, "API_ERROR", detail=str(exc))
             try:
                 res = await self.db.ingest(flights, "LIVE", now_utc())
             except Exception as exc:
                 log.exception("database error during live sync")
-                return await self._record("LIVE", trigger, started, "DB_ERROR", credits=credits,
+                return await self._record(trigger, started, "DB_ERROR",
                                           detail=f"{type(exc).__name__}: {exc}")
             await self.db.set_status("live_access", "OK")
-            return await self._record("LIVE", trigger, started, "OK", res, credits)
-
-    async def sync_history(self, hours: float, trigger: str = "auto") -> dict:
-        """Backfill from POST /flights/geosearch for the previous `hours` (max 24)."""
-        async with self.lock:
-            started = now_utc()
-            blocked = await self._budget_block()
-            if blocked:
-                return await self._record("HISTORY", trigger, started, "SKIPPED", detail=blocked)
-            end = started
-            cursor = end - timedelta(hours=max(0.1, min(24.0, hours)))
-            total = {"received": 0, "in_iraq": 0, "inserted": 0, "updated": 0, "skipped": 0,
-                     "no_evidence": 0}
-            credits = 0
-            notes: list[str] = []
-            status = "OK"
-            try:
-                while cursor < end:
-                    chunk_end = min(end, cursor + BACKFILL_CHUNK)
-                    flights, cost, truncated = await self.api.geosearch(cursor, chunk_end)
-                    credits += cost
-                    if truncated:
-                        notes.append("page cap reached; window partially retrieved")
-                    res = await self.db.ingest(flights, "HISTORY", now_utc())
-                    for k in total:
-                        total[k] += res.get(k, 0)
-                    cursor = chunk_end
-                    if await self._budget_block():
-                        notes.append("stopped early: daily credit budget reached")
-                        status = "PARTIAL"
-                        break
-            except ApiAuthError as exc:
-                await self.db.set_status("history_access", f"UNAVAILABLE: {exc}")
-                return await self._record("HISTORY", trigger, started, "AUTH_ERROR", total, credits, str(exc))
-            except ApiError as exc:
-                await self.db.set_status("history_access", f"ERROR: {exc}")
-                return await self._record("HISTORY", trigger, started, "API_ERROR", total, credits, str(exc))
-            except Exception as exc:
-                log.exception("database error during history sync")
-                return await self._record("HISTORY", trigger, started, "DB_ERROR", total, credits,
-                                          f"{type(exc).__name__}: {exc}")
-            if total["received"] and not total["in_iraq"] and total["no_evidence"] == total["received"]:
-                await self.db.set_status(
-                    "history_access", "NO_TRACKS: flights returned without usable positions[]")
-                notes.append("no flight paths in response; nothing stored (no crossing evidence)")
-            else:
-                await self.db.set_status("history_access", "OK")
-            return await self._record("HISTORY", trigger, started, status, total, credits, "; ".join(notes))
+            await self.db.set_status("provider", provider)
+            return await self._record(trigger, started, "OK", res, f"source {PROVIDERS[provider][0]}")
 
     async def _maintenance(self) -> None:
         days = self.cfg.track_retention_days
@@ -941,24 +893,10 @@ class SyncService:
                           (iso(now_utc() - timedelta(days=60)),))
 
     async def run_forever(self) -> None:
-        ev("sync loop started", interval=self.cfg.sync_interval)
-        # Startup backfill: cover the gap since the last successful sync (max 24 h).
-        try:
-            if self.cfg.backfill_on_start:
-                last_ok = parse_dt(await self.db.scalar(
-                    "SELECT MAX(started_utc) FROM sync_history WHERE status='OK'"))
-                gap = (now_utc() - last_ok).total_seconds() if last_ok else 24 * 3600
-                if gap > 2 * self.cfg.sync_interval:
-                    await self.sync_history(min(24.0, gap / 3600.0), "startup")
-        except Exception:
-            log.exception("startup backfill failed")
-
+        ev("sync loop started", interval=self.cfg.sync_interval, providers=self.cfg.providers)
         while not self.stop.is_set():
             try:
-                if self.auth_block_until and now_utc() < self.auth_block_until:
-                    ev("sync paused after auth failure", until=iso(self.auth_block_until))
-                else:
-                    await self.sync_live("auto")
+                await self.sync_live("auto")
                 self.cycles += 1
                 if self.cycles % 50 == 1:
                     await self._maintenance()
@@ -981,10 +919,9 @@ class Ctx:
     """Shared runtime objects (set in main())."""
     cfg: Config
     db: Database
-    api: AirNavClient
+    api: AdsbClient
     sync: SyncService
     started: datetime
-    lookups: list[float] = []
 
 
 def esc(value: Any) -> str:
@@ -1077,8 +1014,10 @@ async def data_age_line() -> str:
     return f"DATA: synced {ago(last)}" + ("  ⚠ STALE" if stale else "")
 
 
-def route(row: sqlite3.Row) -> str:
-    return f"{row['dep_icao'] or row['dep_iata'] or '????'}→{row['arr_icao'] or row['arr_iata'] or '????'}"
+async def source_line() -> str:
+    provider = await Ctx.db.get_status("provider")
+    name = PROVIDERS[provider][0] if provider in PROVIDERS else "none yet"
+    return f"SOURCE: {name} (ADS-B)"
 
 
 def ident(row: sqlite3.Row) -> str:
@@ -1100,6 +1039,7 @@ async def view_main(update: Update) -> None:
         f"IN AIRSPACE NOW   {live}",
         f"CROSSINGS LOGGED  {total}",
         await data_age_line(),
+        await source_line(),
         SUB,
         "SELECT A MODULE ▼",
     ]
@@ -1172,7 +1112,7 @@ async def view_list(update: Update, context: ContextTypes.DEFAULT_TYPE, kind: st
     row_buf: list[InlineKeyboardButton] = []
     for i, r in enumerate(rows, start=page * PAGE_SIZE + 1):
         mark = "✓" if r["crossing_status"] == "CONFIRMED" else "?"
-        lines.append(f"{i:02d} {ident(r):<8} {r['aircraft_type'] or '----':<4} {route(r)}")
+        lines.append(f"{i:02d} {ident(r):<8} {r['aircraft_type'] or '----':<4} {r['registration'] or ''}")
         alt = f"{int(r['altitude_ft']):>5}ft" if r["altitude_ft"] is not None else "   N/A "
         lines.append(f"   {alt} {local(r['last_seen_utc'], '%d%b %H:%M')} {mark}")
         row_buf.append(btn(f"{i:02d} {ident(r)}", f"F|{r['id']}"))
@@ -1214,9 +1154,7 @@ async def view_flight(update: Update, context: ContextTypes.DEFAULT_TYPE, flight
         return f"{local(r[f'{prefix}_time_utc'])} {r[f'{prefix}_time_kind'][:3]}"
 
     numbers = " / ".join(x for x in (r["flight_number_iata"], r["flight_number_icao"]) if x) or NA
-    airline = r["airline_name"] or NA
-    if r["airline_icao"]:
-        airline = f"{airline} ({r['airline_icao']})" if r["airline_name"] else r["airline_icao"]
+    airline = f"{r['airline_icao']} (from callsign)" if r["airline_icao"] else NA
     model = " ".join(x for x in (r["aircraft_type"], r["aircraft_type_desc"]) if x) or NA
     first, last = parse_dt(r["first_seen_utc"]), parse_dt(r["last_seen_utc"])
     if r["obs_count"] >= 2 and first and last:
@@ -1240,14 +1178,14 @@ async def view_flight(update: Update, context: ContextTypes.DEFAULT_TYPE, flight
         f"TO    {airport('arr')}",
         f"DEP   {when('dep')}",
         f"ARR   {when('arr')}",
-        f"STATE {val(r['api_status'])}",
+        " (route/times: not in ADS-B)",
         SUB + "\n IRAQ AIRSPACE",
         f"FIRST OBS {local(r['first_seen_utc'])}",
         f"LAST OBS  {local(r['last_seen_utc'])}",
         f"DURATION  {duration}",
         f"OBS COUNT {r['obs_count']}",
         f"STATUS    {crossing}",
-        f"TRAFFIC   {r['traffic_type']}",
+        f"CLASS     {val(r['aircraft_classes'])}",
         SUB + "\n LAST POSITION OVER IRAQ",
         f"ALT   {val(r['altitude_ft'], ' ft')}",
         f"GS    {val(r['ground_speed_kt'], ' kt')}",
@@ -1310,78 +1248,26 @@ async def view_aircraft_info(update: Update, flight_id: int) -> None:
         return
     key = r["registration"] or r["mode_s"]
     ac = await Ctx.db.one("SELECT * FROM aircraft WHERE key=?", (key,))
-    note = ""
-    fresh = ac and ac["detail_fetched_utc"] and \
-        (now_utc() - parse_dt(ac["detail_fetched_utc"])).days < 30  # type: ignore[operator]
-    if not fresh:
-        # Each uncached lookup costs API credits: limit non-admin lookups per hour.
-        cutoff = time.monotonic() - 3600
-        Ctx.lookups[:] = [t for t in Ctx.lookups if t > cutoff]
-        if len(Ctx.lookups) >= 20 and not is_admin(update):
-            note = "Lookup limit reached; showing stored data."
-        else:
-            try:
-                Ctx.lookups.append(time.monotonic())
-                data = await Ctx.api.aircraft(r["mode_s"], None if r["mode_s"] else r["registration"])
-                if data:
-                    decom = data.get("decommissioned")
-                    await Ctx.db.run(
-                        "INSERT INTO aircraft(key, registration, mode_s, serial_number, type_icao, "
-                        "type_desc, class_desc, operator_icao, operator_name, first_flight, "
-                        "decommissioned, detail_fetched_utc, first_seen_utc, last_seen_utc) "
-                        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(key) DO UPDATE SET "
-                        "registration=COALESCE(excluded.registration, registration), "
-                        "mode_s=COALESCE(excluded.mode_s, mode_s), "
-                        "serial_number=COALESCE(excluded.serial_number, serial_number), "
-                        "type_icao=COALESCE(excluded.type_icao, type_icao), "
-                        "type_desc=COALESCE(excluded.type_desc, type_desc), "
-                        "class_desc=COALESCE(excluded.class_desc, class_desc), "
-                        "operator_icao=COALESCE(excluded.operator_icao, operator_icao), "
-                        "operator_name=COALESCE(excluded.operator_name, operator_name), "
-                        "first_flight=COALESCE(excluded.first_flight, first_flight), "
-                        "decommissioned=COALESCE(excluded.decommissioned, decommissioned), "
-                        "detail_fetched_utc=excluded.detail_fetched_utc",
-                        (key, clean_str(data.get("registration")) or r["registration"],
-                         clean_str(data.get("modeS")) or r["mode_s"],
-                         clean_str(data.get("serialNumber")), clean_str(data.get("typeIcao")),
-                         clean_str(data.get("typeDescription")), clean_str(data.get("classDescription")),
-                         clean_str(data.get("companyIcao")), clean_str(data.get("companyName")),
-                         clean_str(data.get("firstFlight")),
-                         int(decom) if isinstance(decom, bool) else None,
-                         iso(now_utc()), iso(now_utc()), iso(now_utc())))
-                    ac = await Ctx.db.one("SELECT * FROM aircraft WHERE key=?", (key,))
-                else:
-                    note = "API returned no aircraft record."
-            except ApiError as exc:
-                note = f"API unavailable: {str(exc)[:40]}"
-            except Exception:
-                log.exception("aircraft lookup failed")
-                note = "Lookup failed; showing stored data."
     lines = header(f"AIRCRAFT {key}")
     if ac:
-        decom_text = NA if ac["decommissioned"] is None else ("YES" if ac["decommissioned"] else "NO")
         lines += [
             f"REG       {val(ac['registration'])}",
             f"ICAO24    {val(ac['mode_s'])}",
             f"TYPE      {val(ac['type_icao'])}",
             f"MODEL     {val(ac['type_desc'])[:24]}",
-            f"CLASS     {val(ac['class_desc'])[:24]}",
-            f"OPERATOR  {val(ac['operator_name'])[:24]}",
-            f"OPR ICAO  {val(ac['operator_icao'])}",
-            f"SERIAL    {val(ac['serial_number'])}",
-            f"FIRST FLT {val(ac['first_flight'])[:16]}",
-            f"RETIRED   {decom_text}",
+            f"OWNER/OPR {val(ac['operator_name'])[:24]}",
+            f"CLASS     {val(r['aircraft_classes'])}",
             SUB,
-            f"DETAILS   {'fetched ' + ago(ac['detail_fetched_utc']) if ac['detail_fetched_utc'] else 'from flight data only'}",
+            f"FIRST SEEN {local(ac['first_seen_utc'], '%d %b %Y')}",
+            f"LAST SEEN  {local(ac['last_seen_utc'], '%d %b %Y %H:%M')}",
         ]
         seen = await Ctx.db.scalar(
             "SELECT COUNT(*) FROM flights WHERE registration=? OR mode_s=?",
             (ac["registration"] or "-", ac["mode_s"] or "-"))
-        lines.append(f"RECORDS   {seen} in archive")
+        lines += [f"RECORDS    {seen} in archive", SUB,
+                  "From the ADS-B feed's aircraft", "database. N/A = not provided."]
     else:
         lines.append("NO STORED AIRCRAFT DATA.")
-    if note:
-        lines += [SUB, note]
     await respond(update, pre(lines), kb)
 
 
@@ -1444,9 +1330,6 @@ async def view_stats(update: Update, days: int) -> None:
             f"COUNT(airline_icao) ha, COUNT(aircraft_type) ht, COUNT(dep_icao) hd, COUNT(arr_icao) hr "
             f"FROM flights WHERE {base}", args)
         lines += [f"AIRLINES            {row['a']}", f"AIRCRAFT TYPES      {row['t']}"]
-        kinds = await db.q(
-            f"SELECT traffic_type k, COUNT(*) n FROM flights WHERE {base} GROUP BY k ORDER BY n DESC", args)
-        lines += [SUB, "TRAFFIC MIX"] + [f" {k['k']:<11}{k['n']:>6}" for k in kinds]
 
         async def top(col: str, title: str) -> None:
             rows = await db.q(
@@ -1456,8 +1339,7 @@ async def view_stats(update: Update, days: int) -> None:
 
         await top("airline_icao", "TOP AIRLINES")
         await top("aircraft_type", "TOP AIRCRAFT")
-        await top("dep_icao", "TOP ORIGINS")
-        await top("arr_icao", "TOP DESTINATIONS")
+        lines += [SUB, "ORIGIN / DESTINATION", " N/A: not provided by ADS-B feeds"]
 
         firsts = await db.q(f"SELECT first_seen_utc FROM flights WHERE {base}", args)
         hours = [0] * 24
@@ -1484,7 +1366,7 @@ async def view_stats(update: Update, days: int) -> None:
             return f"{round(100 * n / total):>3}%"
         lines += [SUB, "DATA COMPLETENESS",
                   f" airline {pct(row['ha'])}  type  {pct(row['ht'])}",
-                  f" origin  {pct(row['hd'])}  dest  {pct(row['hr'])}"]
+                  " airline = inferred from callsign"]
     coverage = await db.scalar("SELECT MIN(first_seen_utc) FROM flights")
     lines.append(SUB)
     if coverage:
@@ -1520,7 +1402,6 @@ async def view_status(update: Update) -> None:
     last_ok = await db.scalar("SELECT MAX(finished_utc) FROM sync_history WHERE status='OK'")
     flights = await db.scalar("SELECT COUNT(*) FROM flights") or 0
     obs = await db.scalar("SELECT COUNT(*) FROM track_observations") or 0
-    hist = await db.get_status("history_access") or "UNTESTED"
     live = await db.get_status("live_access") or "UNTESTED"
     nxt = Ctx.sync.next_run
     uptime = now_utc() - Ctx.started
@@ -1528,8 +1409,9 @@ async def view_status(update: Update) -> None:
         f"BOT        ONLINE  v{APP_VERSION}",
         f"UPTIME     {uptime.days}d {uptime.seconds // 3600}h {(uptime.seconds // 60) % 60}m",
         SUB,
-        f"LIVE API   {live[:17]}",
-        f"HISTORY    {hist.split(':')[0][:17]}",
+        f"LIVE FEED  {live[:17]}",
+        (await source_line()).replace("SOURCE:", "SOURCE    "),
+        "HISTORY    own archive only",
         f"LAST SYNC  {ago(last['finished_utc']) if last else NA}",
         f"RESULT     {last['status'] if last else NA}",
         f"LAST OK    {ago(last_ok)}",
@@ -1558,7 +1440,7 @@ HELP_LINES = header("HELP") + [
     "/status   system status",
     SUB,
     "SEARCH: /search QTR  or  /search",
-    "A7-ALA, B77W, ORBI, Emirates …",
+    "A7-ALA, B77W, 06A1E5 …",
     SUB,
     "✓ CONFIRMED = 2+ positions inside",
     "Iraq at least 60 s apart.",
@@ -1591,8 +1473,8 @@ async def prompt_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     context.user_data["await"] = "search"
     lines = header("SEARCH FLIGHT") + [
         "SEND A SEARCH TERM:", SUB,
-        "callsign      QTR8K", "flight number EK943", "registration  A7-ALA",
-        "airline       Emirates / UAE", "aircraft      B77W", "airport       ORBI / BGW"]
+        "callsign      QTR8K", "registration  A7-ALA", "airline code  UAE",
+        "aircraft      B77W", "ICAO24 hex    06A1E5"]
     await respond(update, pre(lines), InlineKeyboardMarkup([menu_row()]))
 
 
@@ -1701,9 +1583,9 @@ def admin_kb() -> InlineKeyboardMarkup:
 
 async def admin_panel(update: Update) -> None:
     lines = header("ADMIN CONSOLE") + [
-        "/system       health + API check",
-        "/sync         run live sync now",
-        "/sync history [hours]  backfill",
+        "/system       health + feed check",
+        "/sync         run a sync now",
+        "/sync log     recent sync results",
         "/database     database statistics",
         "/export [days|all]  CSV export",
         "/restart_info process history"]
@@ -1711,38 +1593,26 @@ async def admin_panel(update: Update) -> None:
 
 
 async def admin_system(update: Update) -> None:
-    api_line, credit_lines = "UNKNOWN", []
-    try:
-        bill = await Ctx.api.billing_status(max_age=30)
-        api_line = "REACHABLE · AUTH OK"
-        credit_lines = [
-            f"SUBSCRIPTION {'ACTIVE' if bill.get('active') else 'INACTIVE/UNKNOWN'}",
-            f"CREDITS LEFT {val(bill.get('availableCredit'))}",
-            f"CREDITS USED {val(bill.get('usedCredit'))}",
-            f"CYCLE ENDS   {str(bill.get('currentBillingCycleEnd') or NA)[:10]}"]
-    except ApiAuthError:
-        api_line = "AUTHENTICATION FAILED"
-    except ApiError as exc:
-        api_line = f"ERROR: {str(exc)[:30]}"
+    api = Ctx.api
     try:
         with open("/proc/self/status") as fh:
             rss = next((l.split()[1] for l in fh if l.startswith("VmRSS")), None)
         mem = f"{int(rss) // 1024} MB" if rss else NA
     except Exception:
         mem = NA
-    task_state = "RUNNING" if not Ctx.sync.stop.is_set() else "STOPPING"
-    used_today = await Ctx.sync.credits_today()
-    budget = Ctx.cfg.daily_credit_budget
+    state = "REACHABLE" if api.last_ok and not api.last_error else (
+        "FAILING" if api.last_error else "NOT CONTACTED YET")
     lines = header("SYSTEM HEALTH") + [
-        f"API       {api_line}",
-        f"LATENCY   {val(Ctx.api.last_latency_ms, ' ms')}",
-        f"LAST ERR  {(Ctx.api.last_error or 'none')[:40]}",
-        *credit_lines,
-        f"SPENT TODAY  {used_today} (by syncs)",
-        f"DAILY BUDGET {budget if budget else 'unlimited'}",
+        f"FEED      {state}",
+        f"PROVIDER  {PROVIDERS[api.last_provider][0] if api.last_provider else NA}",
+        f"ORDER     {','.join(Ctx.cfg.providers)[:30]}",
+        f"LAST OK   {ago(iso(api.last_ok)) if api.last_ok else NA}",
+        f"LATENCY   {val(api.last_latency_ms, ' ms')}",
+        f"LAST ERR  {(api.last_error or 'none')[:60]}",
+        "(use SYNC NOW to test the feed)",
         SUB,
-        f"SYNC TASK {task_state}",
-        f"HISTORY   {(await Ctx.db.get_status('history_access') or 'UNTESTED')[:60]}",
+        f"SYNC TASK {'RUNNING' if not Ctx.sync.stop.is_set() else 'STOPPING'}",
+        f"CYCLES    {Ctx.sync.cycles}",
         SUB,
         f"PYTHON    {platform.python_version()}",
         f"MEMORY    {mem}",
@@ -1790,36 +1660,33 @@ async def admin_database(update: Update) -> None:
 
 async def admin_synclog(update: Update) -> None:
     rows = await Ctx.db.q("SELECT * FROM sync_history ORDER BY id DESC LIMIT 12")
-    lines = header("SYNC HISTORY") + ["TIME  KIND STATUS     IRQ  CR"]
+    lines = header("SYNC HISTORY") + ["TIME  STATUS       RECV  IRQ"]
     for r in rows:
-        lines.append(f"{local(r['started_utc'], '%H:%M')} {r['kind'][:4]:<4} {r['status'][:10]:<10} "
-                     f"{r['in_iraq']:>3} {r['credits']:>3}")
+        lines.append(f"{local(r['started_utc'], '%H:%M')} {r['status'][:12]:<12} "
+                     f"{r['received']:>4} {r['in_iraq']:>4}")
         if r["status"] != "OK" and r["detail"]:
             lines.append(f"  └ {r['detail'][:60]}")
     if not rows:
         lines.append("NO SYNCHRONISATION YET.")
-    lines += [SUB, "IRQ = flights with positions in", "Iraq.  CR = API credits."]
+    lines += [SUB, "RECV = aircraft in query area", "IRQ  = with positions in Iraq"]
     await respond(update, pre(lines), admin_kb())
 
 
 def sync_report(row: dict) -> list[str]:
     return [
-        f"KIND      {row['kind']}", f"STATUS    {row['status']}",
+        f"STATUS    {row['status']}",
         f"RECEIVED  {row['received']}", f"IN IRAQ   {row['in_iraq']}",
         f"NEW       {row['inserted']}", f"UPDATED   {row['updated']}",
-        f"SKIPPED   {row['skipped']}", f"CREDITS   {row['credits']}",
+        f"OUTSIDE   {row['skipped']}",
     ] + ([f"NOTE      {row['detail'][:120]}"] if row["detail"] else [])
 
 
-async def admin_sync(update: Update, history_hours: Optional[float] = None) -> None:
+async def admin_sync(update: Update) -> None:
     if Ctx.sync.lock.locked():
         await respond(update, pre(["A SYNC IS ALREADY RUNNING."]), admin_kb())
         return
     await respond(update, pre(["SYNCHRONISING …"]))
-    if history_hours is None:
-        row = await Ctx.sync.sync_live("manual")
-    else:
-        row = await Ctx.sync.sync_history(history_hours, "manual")
+    row = await Ctx.sync.sync_live("manual")
     await respond(update, pre(header("MANUAL SYNC") + sync_report(row)), admin_kb())
 
 
@@ -1838,11 +1705,9 @@ async def admin_restart_info(update: Update) -> None:
     await respond(update, pre(lines), admin_kb())
 
 
-EXPORT_COLS = ["id", "callsign", "flight_number_iata", "flight_number_icao", "airline_icao",
-               "airline_name", "aircraft_type", "aircraft_type_desc", "registration", "mode_s",
-               "dep_icao", "dep_iata", "dep_city", "dep_country", "arr_icao", "arr_iata", "arr_city",
-               "arr_country", "dep_time_utc", "dep_time_kind", "arr_time_utc", "arr_time_kind",
-               "first_seen_utc", "last_seen_utc", "obs_count", "crossing_status", "traffic_type",
+EXPORT_COLS = ["id", "callsign", "airline_icao", "aircraft_type", "aircraft_type_desc",
+               "aircraft_classes", "registration", "mode_s",
+               "first_seen_utc", "last_seen_utc", "obs_count", "crossing_status",
                "altitude_ft", "ground_speed_kt", "heading", "latitude", "longitude", "data_source"]
 
 
@@ -1883,13 +1748,7 @@ async def cmd_system(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 @admin_only
 async def cmd_sync(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     args = context.args or []
-    if args and args[0].lower() in ("history", "backfill"):
-        try:
-            hours = float(args[1]) if len(args) > 1 else 24.0
-        except ValueError:
-            hours = 24.0
-        await admin_sync(update, hours)
-    elif args and args[0].lower() == "log":
+    if args and args[0].lower() == "log":
         await admin_synclog(update)
     else:
         await admin_sync(update)
@@ -2024,7 +1883,7 @@ async def heartbeat(stop: asyncio.Event) -> None:
                 flights = await Ctx.db.scalar("SELECT COUNT(*) FROM flights")
                 ev("health", status="alive", flights=flights,
                    uptime_s=int((now_utc() - Ctx.started).total_seconds()),
-                   api_last_error=Ctx.api.last_error)
+                   feed_last_error=Ctx.api.last_error)
             except Exception:
                 log.exception("health check failed")
 
@@ -2062,7 +1921,7 @@ async def amain() -> int:
         log.critical("DATABASE ERROR: cannot open %s: %s", cfg.db_path, exc)
         return 2
 
-    api = AirNavClient(cfg.api_key)
+    api = AdsbClient(cfg.providers)
     sync = SyncService(cfg, db, api)
     sync.stop = stop
     Ctx.cfg, Ctx.db, Ctx.api, Ctx.sync, Ctx.started = cfg, db, api, sync, now_utc()
