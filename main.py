@@ -36,6 +36,13 @@ Aircraft seen only outside the polygon (inside the three query circles, i.e.
 up to ~250 NM around Iraq) are stored as NEARBY.  They appear in the
 "AROUND IRAQ" view and in search, never in crossing lists or statistics, and
 are deleted after NEARBY_RETENTION_DAYS.
+
+Worldwide, on demand only: /world looks up one aircraft anywhere by callsign,
+registration or ICAO24 hex, and /near (or a shared Telegram location) lists
+aircraft around any point.  These use the feeds' per-aircraft and point
+endpoints (adsb.fi: /v2/callsign, /v2/registration, /v2/hex, verified in its
+README; the adsb.lol and airplanes.live paths are unverified).  Results are
+stored as WORLD and deleted on the same schedule as NEARBY.
 """
 from __future__ import annotations
 
@@ -46,6 +53,7 @@ import html
 import io
 import json
 import logging
+import math
 import os
 import platform
 import random
@@ -99,10 +107,23 @@ PROVIDERS = {
 # Three 250 NM circles (the maximum radius the feeds allow) that together cover Iraq.
 QUERY_RADIUS_NM = 250
 QUERY_CIRCLES = [(33.0, 41.6), (35.2, 44.6), (31.2, 46.0)]
+# Per-aircraft lookup URLs for the worldwide on-demand search.
+LOOKUP_URLS = {
+    "adsbfi": {"callsign": "https://opendata.adsb.fi/api/v2/callsign/{q}",
+               "reg": "https://opendata.adsb.fi/api/v2/registration/{q}",
+               "hex": "https://opendata.adsb.fi/api/v2/hex/{q}"},
+    "adsblol": {"callsign": "https://api.adsb.lol/v2/callsign/{q}",
+                "reg": "https://api.adsb.lol/v2/reg/{q}",
+                "hex": "https://api.adsb.lol/v2/hex/{q}"},
+    "airplaneslive": {"callsign": "https://api.airplanes.live/v2/callsign/{q}",
+                      "reg": "https://api.airplanes.live/v2/reg/{q}",
+                      "hex": "https://api.airplanes.live/v2/hex/{q}"},
+}
+WORLD_LIST_LIMIT = 40
 MAX_POSITION_AGE = 300  # seconds; older positions are ignored. Each position is
                         # stored with its own true timestamp (feed time - age).
 APP_NAME = "IRAQ AIR TRAFFIC MONITOR"
-APP_VERSION = "2.3.0"
+APP_VERSION = "2.4.0"
 
 # Simplified Iraq land-boundary polygon (lon, lat), clockwise from the
 # Turkey/Syria/Iraq tripoint.  Accuracy is roughly 10-20 km: flights that only
@@ -303,6 +324,17 @@ def clean_num(value: Any) -> Optional[float]:
         return None
 
 
+def dist_nm(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    la1, lo1, la2, lo2 = map(math.radians, (lat1, lon1, lat2, lon2))
+    h = math.sin((la2 - la1) / 2) ** 2 + math.cos(la1) * math.cos(la2) * math.sin((lo2 - lo1) / 2) ** 2
+    return 2 * 3440.065 * math.asin(min(1.0, math.sqrt(h)))
+
+
+def in_region(lat: float, lon: float) -> bool:
+    """Inside the area the bot monitors continuously (Iraq and ~250 NM around it)."""
+    return any(dist_nm(lat, lon, c[0], c[1]) <= QUERY_RADIUS_NM for c in QUERY_CIRCLES)
+
+
 def point_in_iraq(lat: float, lon: float) -> bool:
     if not (BBOX["minLatitude"] <= lat <= BBOX["maxLatitude"]
             and BBOX["minLongitude"] <= lon <= BBOX["maxLongitude"]):
@@ -467,6 +499,52 @@ class AdsbClient:
                 if key and (key not in merged or record["updated"] > merged[key]["updated"]):
                     merged[key] = record
         return list(merged.values()), raw_count
+
+    def _records(self, data: dict, provider: str) -> list[dict]:
+        aircraft = data.get("ac")
+        if aircraft is None:
+            aircraft = data.get("aircraft")
+        if not isinstance(aircraft, list):
+            raise ApiError("no aircraft list in response")
+        feed_now = parse_dt(data.get("now")) or now_utc()
+        if abs((feed_now - now_utc()).total_seconds()) > 120:
+            feed_now = now_utc()
+        out = []
+        for ac in aircraft:
+            if isinstance(ac, dict):
+                try:
+                    record = self.normalize(ac, feed_now, provider)
+                except Exception:
+                    record = None
+                if record:
+                    out.append(record)
+        return out
+
+    async def _first(self, urls: list[tuple[str, str]]) -> tuple[list[dict], str, int]:
+        """Ask providers in turn; return the first non-empty answer.
+        Returns (records, provider name, providers that answered)."""
+        answered = 0
+        for provider, url in urls:
+            try:
+                records = self._records(await self._get(url), provider)
+            except ApiError as exc:
+                log.warning("world lookup failed", extra={"data": {"provider": provider, "error": str(exc)}})
+                continue
+            answered += 1
+            if records:
+                return records, PROVIDERS[provider][0], answered
+        return [], "", answered
+
+    async def find(self, kind: str, query: str) -> tuple[list[dict], str, int]:
+        """One aircraft anywhere in the world by callsign / registration / hex."""
+        return await self._first([(p, LOOKUP_URLS[p][kind].format(q=query)) for p in self.providers])
+
+    async def around(self, lat: float, lon: float, radius_nm: int) -> tuple[list[dict], str, int]:
+        """Aircraft within radius_nm (max 250) of any point on Earth."""
+        radius_nm = max(1, min(QUERY_RADIUS_NM, radius_nm))
+        return await self._first([
+            (p, PROVIDERS[p][2].format(lat=round(lat, 4), lon=round(lon, 4), dist=radius_nm))
+            for p in self.providers])
 
     async def snapshot(self) -> tuple[list[dict], str, str]:
         """Current aircraft around Iraq, merged from every configured provider so
@@ -721,7 +799,7 @@ class Enricher:
         """Enrich recent flights seen inside Iraq that have not been looked up yet."""
         rows = await self.db.q(
             "SELECT f.id FROM flights f LEFT JOIN aircraft a ON a.key=COALESCE(f.registration, f.mode_s) "
-            "WHERE f.crossing_status<>'NEARBY' AND f.last_seen_utc>=? AND "
+            "WHERE f.crossing_status IN ('CONFIRMED','SINGLE_OBS') AND f.last_seen_utc>=? AND "
             "(f.route_checked_utc IS NULL OR "
             " (a.key IS NOT NULL AND a.detail_fetched_utc IS NULL)) "
             "ORDER BY f.last_seen_utc DESC LIMIT ?",
@@ -923,7 +1001,7 @@ class Database:
         """Store a batch of ApiFlight objects. One bad record never aborts the batch."""
         assert self.conn
         res = {"received": len(flights), "in_iraq": 0, "nearby": 0, "inserted": 0, "updated": 0,
-               "skipped": 0, "no_evidence": 0}
+               "skipped": 0, "no_evidence": 0, "ids": []}
         async with self.write_lock:
             await self.conn.execute("BEGIN IMMEDIATE")
             try:
@@ -940,6 +1018,7 @@ class Database:
                             "error": f"{type(exc).__name__}: {exc}"}})
                     if outcome in ("inserted", "updated"):
                         res["in_iraq" if zone == "IRAQ" else "nearby"] += 1
+                        res["ids"].append(self._last_id)
                     if outcome in res:
                         res[outcome] += 1
                 await self.conn.execute("COMMIT")
@@ -968,7 +1047,7 @@ class Database:
                     "hdg": clean_num(p.get("heading")), "vr": clean_num(p.get("verticalRate")),
                     "ground": on_ground, "src": clean_str(p.get("source")),
                 })
-        if source == "LIVE":
+        if source in ("LIVE", "WORLD"):
             # The top-level position of a live flight is its current position.
             lat, lon = clean_num(raw.get("latitude")), clean_num(raw.get("longitude"))
             if lat is not None and lon is not None:
@@ -1072,12 +1151,15 @@ class Database:
             crossing = "CONFIRMED" if count >= 2 and spread >= CONFIRM_MIN_SECONDS else "SINGLE_OBS"
             pos_filter = "AND in_iraq=1"
         else:
-            # Never observed inside Iraq: keep as NEARBY, spanning all its positions.
-            zone, crossing, pos_filter = "NEARBY", "NEARBY", ""
+            # Never observed inside Iraq: NEARBY if within the monitored region,
+            # otherwise WORLD (found by an on-demand worldwide lookup).
+            pos_filter = ""
             async with self.conn.execute(
                 "SELECT MIN(ts_utc), MAX(ts_utc) FROM track_observations WHERE flight_id=?",
                 (flight_id,)) as cur:
                 first, last = await cur.fetchone()
+            newest = max(obs, key=lambda o: o["ts"])
+            zone = crossing = "NEARBY" if in_region(newest["lat"], newest["lon"]) else "WORLD"
         async with self.conn.execute(
             "SELECT latitude, longitude, altitude_ft, ground_speed_kt, heading FROM track_observations "
             f"WHERE flight_id=? {pos_filter} ORDER BY ts_utc DESC LIMIT 1", (flight_id,)) as cur:
@@ -1113,6 +1195,7 @@ class Database:
                 (ac_key, fields["registration"], fields["mode_s"], fields["aircraft_type"],
                  fields["aircraft_type_desc"], None, clean_str(raw.get("ownerOperator")),
                  stamp, stamp))
+        self._last_id = flight_id
         return outcome, zone
 
 
@@ -1178,7 +1261,7 @@ class SyncService:
         # Aircraft that never entered Iraq are short-lived context, not archive.
         near_cut = iso(now_utc() - timedelta(days=self.cfg.nearby_retention_days))
         await self.db.run(
-            "DELETE FROM flights WHERE crossing_status='NEARBY' AND last_seen_utc<?", (near_cut,))
+            "DELETE FROM flights WHERE crossing_status IN ('NEARBY','WORLD') AND last_seen_utc<?", (near_cut,))
         await self.db.run(
             "DELETE FROM track_observations WHERE in_iraq=0 AND ts_utc<?", (near_cut,))
         await self.db.run("DELETE FROM sync_history WHERE started_utc<?",
@@ -1282,6 +1365,7 @@ def main_menu_kb() -> InlineKeyboardMarkup:
         [btn("[ LIVE AIRCRAFT ]", "L|live|-|0")],
         [btn("[ AROUND IRAQ ]", "L|near|-|0")],
         [btn("[ SEARCH FLIGHT ]", "M|search")],
+        [btn("[ 🌍 WORLD SEARCH ]", "M|world")],
         [btn("[ AIRLINES ]", "AL|0"), btn("[ AIRCRAFT ]", "AC|0")],
         [btn("[ STATISTICS ]", "S|1")],
         [btn("[ FLIGHT ARCHIVE ]", "M|archive")],
@@ -1334,7 +1418,7 @@ async def view_main(update: Update) -> None:
     total = await Ctx.db.scalar("SELECT COUNT(*) FROM flights WHERE crossing_status='CONFIRMED'") or 0
     live_cut = iso(now_utc() - timedelta(seconds=max(600, 2 * Ctx.cfg.sync_interval)))
     live = await Ctx.db.scalar(
-        "SELECT COUNT(*) FROM flights WHERE last_seen_utc>=? AND crossing_status<>'NEARBY'", (live_cut,)) or 0
+        "SELECT COUNT(*) FROM flights WHERE last_seen_utc>=? AND crossing_status IN ('CONFIRMED','SINGLE_OBS')", (live_cut,)) or 0
     near = await Ctx.db.scalar(
         "SELECT COUNT(*) FROM flights WHERE last_seen_utc>=? AND crossing_status='NEARBY'",
         (live_cut,)) or 0
@@ -1368,10 +1452,10 @@ def list_filter(kind: str, arg: str, user_data: dict) -> tuple[str, str, tuple]:
     """Return (title, where-clause, args) for a flight list context."""
     now = now_utc()
     if kind == "24h":
-        return "LAST 24 HOURS", "last_seen_utc>=? AND crossing_status<>'NEARBY'", (iso(now - timedelta(hours=24)),)
+        return "LAST 24 HOURS", "last_seen_utc>=? AND crossing_status IN ('CONFIRMED','SINGLE_OBS')", (iso(now - timedelta(hours=24)),)
     if kind == "live":
         window = max(600, 2 * Ctx.cfg.sync_interval)
-        return "LIVE AIRCRAFT", "last_seen_utc>=? AND crossing_status<>'NEARBY'", (iso(now - timedelta(seconds=window)),)
+        return "LIVE AIRCRAFT", "last_seen_utc>=? AND crossing_status IN ('CONFIRMED','SINGLE_OBS')", (iso(now - timedelta(seconds=window)),)
     if kind == "near":
         window = max(600, 2 * Ctx.cfg.sync_interval)
         return ("AROUND IRAQ · LIVE", "last_seen_utc>=? AND crossing_status='NEARBY'",
@@ -1381,19 +1465,24 @@ def list_filter(kind: str, arg: str, user_data: dict) -> tuple[str, str, tuple]:
             rng = user_data.get("range")
             if not rng:
                 return "ARCHIVE", "0", ()
-            return (f"ARCHIVE {rng[2]}", "last_seen_utc>=? AND first_seen_utc<? AND crossing_status<>'NEARBY'",
+            return (f"ARCHIVE {rng[2]}", "last_seen_utc>=? AND first_seen_utc<? AND crossing_status IN ('CONFIRMED','SINGLE_OBS')",
                     (rng[0], rng[1]))
         days = int(arg)
         label = "24 HOURS" if days == 1 else f"{days} DAYS"
-        return f"ARCHIVE · {label}", "last_seen_utc>=? AND crossing_status<>'NEARBY'", (iso(now - timedelta(days=days)),)
+        return f"ARCHIVE · {label}", "last_seen_utc>=? AND crossing_status IN ('CONFIRMED','SINGLE_OBS')", (iso(now - timedelta(days=days)),)
     if kind == "al":
         if arg == "-":
-            return "AIRLINE · UNKNOWN", "airline_icao IS NULL AND crossing_status<>'NEARBY'", ()
-        return f"AIRLINE · {arg}", "airline_icao=? AND crossing_status<>'NEARBY'", (arg,)
+            return "AIRLINE · UNKNOWN", "airline_icao IS NULL AND crossing_status IN ('CONFIRMED','SINGLE_OBS')", ()
+        return f"AIRLINE · {arg}", "airline_icao=? AND crossing_status IN ('CONFIRMED','SINGLE_OBS')", (arg,)
     if kind == "ac":
         if arg == "-":
-            return "TYPE · UNKNOWN", "aircraft_type IS NULL AND crossing_status<>'NEARBY'", ()
-        return f"TYPE · {arg}", "aircraft_type=? AND crossing_status<>'NEARBY'", (arg,)
+            return "TYPE · UNKNOWN", "aircraft_type IS NULL AND crossing_status IN ('CONFIRMED','SINGLE_OBS')", ()
+        return f"TYPE · {arg}", "aircraft_type=? AND crossing_status IN ('CONFIRMED','SINGLE_OBS')", (arg,)
+    if kind == "w":
+        ids = [int(i) for i in (user_data.get("world_ids") or [])][:WORLD_LIST_LIMIT]
+        if not ids:
+            return "WORLD", "0", ()
+        return (user_data.get("world_title") or "WORLD")[:24], f"id IN ({','.join(map(str, ids))})", ()
     if kind == "s":
         query = (user_data.get("query") or "").strip()
         if not query:
@@ -1424,7 +1513,7 @@ async def view_list(update: Update, context: ContextTypes.DEFAULT_TYPE, kind: st
     buttons: list[list[InlineKeyboardButton]] = []
     row_buf: list[InlineKeyboardButton] = []
     for i, r in enumerate(rows, start=page * PAGE_SIZE + 1):
-        mark = {"CONFIRMED": "✓", "NEARBY": "○"}.get(r["crossing_status"], "?")
+        mark = {"CONFIRMED": "✓", "NEARBY": "○", "WORLD": "🌍"}.get(r["crossing_status"], "?")
         lines.append(f"{i:02d} {ident(r):<8} {r['aircraft_type'] or '----':<4} {route(r)}")
         alt = f"{int(r['altitude_ft']):>5}ft" if r["altitude_ft"] is not None else "   N/A "
         lines.append(f"   {alt} {local(r['last_seen_utc'], '%d%b %H:%M')} {mark}")
@@ -1435,7 +1524,7 @@ async def view_list(update: Update, context: ContextTypes.DEFAULT_TYPE, kind: st
     if row_buf:
         buttons.append(row_buf)
     if rows:
-        lines += [SUB, "✓ crossed Iraq  ? one position", "○ around Iraq only (not inside)"]
+        lines += [SUB, "✓ crossed Iraq  ? one position", "○ around Iraq  🌍 rest of world"]
     nav: list[InlineKeyboardButton] = []
     if page > 0:
         nav.append(btn("◀ PREV", f"L|{kind}|{arg}|{page - 1}"))
@@ -1443,6 +1532,8 @@ async def view_list(update: Update, context: ContextTypes.DEFAULT_TYPE, kind: st
     if page < pages - 1:
         nav.append(btn("NEXT ▶", f"L|{kind}|{arg}|{page + 1}"))
     buttons.append(nav)
+    if kind == "s" and context.user_data.get("query"):
+        buttons.append([btn("🌍 SEARCH THIS WORLDWIDE (LIVE)", "W|q")])
     if kind == "ar" and is_admin(update) and arg != "c":
         buttons.append([btn("⬇ EXPORT CSV", f"X|{arg}")])
     buttons.append(menu_row())
@@ -1485,9 +1576,9 @@ async def view_flight(update: Update, context: ContextTypes.DEFAULT_TYPE, flight
         duration = f"≥ {max(1, int((last - first).total_seconds() // 60))} min (observed)"
     else:
         duration = "N/A (needs 2+ obs)"
-    nearby = r["crossing_status"] == "NEARBY"
-    crossing = {"CONFIRMED": "CONFIRMED CROSSING", "NEARBY": "NOT IN IRAQ (NEARBY)"}.get(
-        r["crossing_status"], "UNCONFIRMED (1 OBS)")
+    nearby = r["crossing_status"] in ("NEARBY", "WORLD")
+    crossing = {"CONFIRMED": "CONFIRMED CROSSING", "NEARBY": "NOT IN IRAQ (NEARBY)",
+                "WORLD": "NOT IN IRAQ (WORLD)"}.get(r["crossing_status"], "UNCONFIRMED (1 OBS)")
     pos = (f"{abs(r['latitude']):.2f}{'N' if r['latitude'] >= 0 else 'S'} "
            f"{abs(r['longitude']):.2f}{'E' if r['longitude'] >= 0 else 'W'}"
            if r["latitude"] is not None else NA)
@@ -1502,9 +1593,9 @@ async def view_flight(update: Update, context: ContextTypes.DEFAULT_TYPE, flight
         f"FROM  {airport('dep')}",
         f"TO    {airport('arr')}",
         *route_note,
-        f"TRAFFIC   {r['traffic_type']}",
+        *([] if nearby else [f"TRAFFIC   {r['traffic_type']}"]),
         "DEP/ARR TIMES  N/A (no source)",
-        SUB + ("\n AROUND IRAQ (OUTSIDE BORDER)" if nearby else "\n IRAQ AIRSPACE"),
+        SUB + ("\n OBSERVED (OUTSIDE IRAQ)" if nearby else "\n IRAQ AIRSPACE"),
         f"FIRST OBS {local(r['first_seen_utc'])}",
         f"LAST OBS  {local(r['last_seen_utc'])}",
         f"DURATION  {duration}",
@@ -1527,7 +1618,7 @@ async def view_flight(update: Update, context: ContextTypes.DEFAULT_TYPE, flight
             "🗺 OPEN LAST POSITION ON MAP",
             url=f"https://www.google.com/maps?q={r['latitude']:.4f},{r['longitude']:.4f}")]]
           if r["latitude"] is not None else []),
-        [btn("⟳ REFRESH", f"F|{flight_id}")] + ([btn("◀ BACK", back)] if back else []),
+        [btn("⟳ LIVE UPDATE", f"WU|{flight_id}")] + ([btn("◀ BACK", back)] if back else []),
         menu_row(),
     ]
     await respond(update, pre(lines), InlineKeyboardMarkup(kb))
@@ -1616,12 +1707,12 @@ async def view_group(update: Update, context: ContextTypes.DEFAULT_TYPE, mode: s
         name_sql = "MAX(aircraft_type_desc)"
     per = 10
     total = await Ctx.db.scalar(
-        f"SELECT COUNT(DISTINCT COALESCE({col}, '-')) FROM flights WHERE crossing_status<>'NEARBY'") or 0
+        f"SELECT COUNT(DISTINCT COALESCE({col}, '-')) FROM flights WHERE crossing_status IN ('CONFIRMED','SINGLE_OBS')") or 0
     pages = max(1, (total + per - 1) // per)
     page = max(0, min(page, pages - 1))
     rows = await Ctx.db.q(
         f"SELECT COALESCE({col}, '-') AS code, {name_sql} AS name, COUNT(*) AS n FROM flights "
-        f"WHERE crossing_status<>'NEARBY' GROUP BY code ORDER BY n DESC, code LIMIT ? OFFSET ?", (per, page * per))
+        f"WHERE crossing_status IN ('CONFIRMED','SINGLE_OBS') GROUP BY code ORDER BY n DESC, code LIMIT ? OFFSET ?", (per, page * per))
     lines = header(title) + [f"DISTINCT {total}   PAGE {page + 1}/{pages}", "FLIGHTS SEEN INSIDE IRAQ", SUB]
     buttons: list[list[InlineKeyboardButton]] = []
     buf: list[InlineKeyboardButton] = []
@@ -1707,7 +1798,7 @@ async def view_stats(update: Update, days: int) -> None:
         lines += [SUB, "DATA COMPLETENESS",
                   f" airline {pct(row['ha'])}  type  {pct(row['ht'])}",
                   f" route   {pct(row['hd'])}  (by callsign DB)"]
-    coverage = await db.scalar("SELECT MIN(first_seen_utc) FROM flights WHERE crossing_status<>'NEARBY'")
+    coverage = await db.scalar("SELECT MIN(first_seen_utc) FROM flights WHERE crossing_status IN ('CONFIRMED','SINGLE_OBS')")
     lines.append(SUB)
     if coverage:
         lines.append(f"ARCHIVE STARTS {local(coverage, '%d %b %Y')}")
@@ -1722,7 +1813,7 @@ async def view_stats(update: Update, days: int) -> None:
 
 
 async def view_archive_menu(update: Update) -> None:
-    coverage = await Ctx.db.scalar("SELECT MIN(first_seen_utc) FROM flights WHERE crossing_status<>'NEARBY'")
+    coverage = await Ctx.db.scalar("SELECT MIN(first_seen_utc) FROM flights WHERE crossing_status IN ('CONFIRMED','SINGLE_OBS')")
     lines = header("FLIGHT ARCHIVE") + [
         f"ARCHIVE STARTS {local(coverage, '%d %b %Y') if coverage else NA}",
         "Only flights actually collected",
@@ -1740,7 +1831,7 @@ async def view_status(update: Update) -> None:
     db = Ctx.db
     last = await db.one("SELECT * FROM sync_history ORDER BY id DESC LIMIT 1")
     last_ok = await db.scalar("SELECT MAX(finished_utc) FROM sync_history WHERE status='OK'")
-    flights = await db.scalar("SELECT COUNT(*) FROM flights WHERE crossing_status<>'NEARBY'") or 0
+    flights = await db.scalar("SELECT COUNT(*) FROM flights WHERE crossing_status IN ('CONFIRMED','SINGLE_OBS')") or 0
     obs = await db.scalar("SELECT COUNT(*) FROM track_observations") or 0
     live = await db.get_status("live_access") or "UNTESTED"
     nxt = Ctx.sync.next_run
@@ -1778,6 +1869,8 @@ HELP_LINES = header("HELP") + [
     "/last24   flights, last 24 hours",
     "/live     aircraft in airspace now",
     "/around   aircraft around Iraq now",
+    "/world    any aircraft, worldwide",
+    "/near     aircraft near lat lon",
     "/search   search the archive",
     "/flight   open one flight",
     "/airlines airlines seen",
@@ -1795,6 +1888,7 @@ HELP_LINES = header("HELP") + [
     "as a crossing.",
     "○ = seen only outside Iraq, within",
     "~250 NM. Kept a few days only.",
+    "🌍 = found by a worldwide search.",
 ]
 
 
@@ -1882,6 +1976,140 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await view_status(update)
 
 
+# --------------------------------------------------------------------------
+# WORLDWIDE ON-DEMAND LOOKUPS
+# --------------------------------------------------------------------------
+WORLD_QUERY = re.compile(r"^[A-Z0-9-]{2,10}$")
+HEX_QUERY = re.compile(r"^[0-9A-F]{6}$")
+
+
+def world_throttled(context: ContextTypes.DEFAULT_TYPE, seconds: float = 4.0) -> bool:
+    """Each worldwide lookup hits the community feeds directly: space them out per user."""
+    last = context.user_data.get("world_ts", 0.0)
+    if time.monotonic() - last < seconds:
+        return True
+    context.user_data["world_ts"] = time.monotonic()
+    return False
+
+
+async def prompt_world(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    context.user_data["await"] = "world"
+    lines = header("WORLD SEARCH · LIVE") + [
+        "FIND ONE AIRCRAFT ANYWHERE:", " send callsign   QTR8K",
+        " or registration A7-ALA", " or ICAO24 hex   06A1E5", SUB,
+        "AIRCRAFT AROUND ANY PLACE:", " send a 📍 location (attach →",
+        " Location), or type:", " /near 51.47 -0.45", " /near 25.25 55.36 150", SUB,
+        "Live only: airborne aircraft in", "range of a volunteer receiver."]
+    await respond(update, pre(lines), InlineKeyboardMarkup([menu_row()]))
+
+
+async def show_world_results(update: Update, context: ContextTypes.DEFAULT_TYPE, records: list[dict],
+                             title: str, provider: str) -> None:
+    res = await Ctx.db.ingest(records, "WORLD", now_utc())
+    ids = res["ids"]
+    kb = InlineKeyboardMarkup([[btn("🌍 NEW WORLD SEARCH", "M|world")], menu_row()])
+    if not ids:
+        await respond(update, pre(header(title) + [
+            "FOUND, BUT NOT AIRBORNE:", "the aircraft is on the ground or",
+            "has no recent position.", SUB, f"SOURCE: {provider}"]), kb)
+        return
+    context.user_data.pop("await", None)
+    if len(ids) == 1:
+        context.user_data.pop("back", None)
+        await view_flight(update, context, ids[0])
+        return
+    context.user_data["world_ids"] = ids[:WORLD_LIST_LIMIT]
+    context.user_data["world_title"] = title
+    await view_list(update, context, "w", "-", 0)
+
+
+async def run_world(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+    query = text.strip().upper().replace(" ", "")
+    kb = InlineKeyboardMarkup([[btn("🌍 NEW WORLD SEARCH", "M|world")], menu_row()])
+    if not WORLD_QUERY.match(query):
+        await respond(update, pre(["INVALID IDENTIFIER.", "Use letters, digits and '-' only,",
+                                   "2 to 10 characters."]), kb)
+        return
+    if world_throttled(context):
+        await respond(update, pre(["PLEASE WAIT A FEW SECONDS", "BETWEEN WORLD SEARCHES."]), kb)
+        return
+    kinds = ["hex", "callsign"] if HEX_QUERY.match(query) else (
+        ["reg"] if "-" in query else ["callsign", "reg"])
+    records: list[dict] = []
+    provider, answered = "", 0
+    for kind in kinds:
+        records, provider, n = await Ctx.api.find(kind, query)
+        answered += n
+        if records:
+            break
+    if not records:
+        reason = (["NO FEED ANSWERED. Try again later."] if not answered else
+                  ["NOT FOUND LIVE. Possible reasons:", " · not flying right now",
+                   " · outside receiver coverage", " · different callsign in use"])
+        await respond(update, pre(header(f"WORLD · {query}") + reason), kb)
+        return
+    await show_world_results(update, context, records, f"WORLD · {query}", provider)
+
+
+async def run_near(update: Update, context: ContextTypes.DEFAULT_TYPE, lat: float, lon: float,
+                   radius_nm: int = 100) -> None:
+    kb = InlineKeyboardMarkup([[btn("🌍 NEW WORLD SEARCH", "M|world")], menu_row()])
+    if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+        await respond(update, pre(["INVALID COORDINATES.", "Example: /near 51.47 -0.45"]), kb)
+        return
+    if world_throttled(context):
+        await respond(update, pre(["PLEASE WAIT A FEW SECONDS", "BETWEEN WORLD SEARCHES."]), kb)
+        return
+    radius_nm = max(5, min(QUERY_RADIUS_NM, radius_nm))
+    records, provider, answered = await Ctx.api.around(lat, lon, radius_nm)
+    title = f"NEAR {lat:.1f},{lon:.1f} {radius_nm}NM"
+    if not records:
+        reason = "NO FEED ANSWERED. Try again later." if not answered else "NO AIRCRAFT SEEN IN THIS AREA."
+        await respond(update, pre(header(title) + [reason]), kb)
+        return
+    airborne = [r for r in records if r["status"] != "ON_GROUND"]
+    airborne.sort(key=lambda r: dist_nm(lat, lon, r["latitude"], r["longitude"]))
+    await show_world_results(update, context, airborne[:WORLD_LIST_LIMIT], title, provider)
+
+
+async def cmd_world(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if context.args:
+        await run_world(update, context, "".join(context.args))
+    else:
+        await prompt_world(update, context)
+
+
+async def cmd_near(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    args = [a.replace(",", " ") for a in (context.args or [])]
+    parts = " ".join(args).split()
+    try:
+        lat, lon = float(parts[0]), float(parts[1])
+        radius = int(float(parts[2])) if len(parts) > 2 else 100
+    except (ValueError, IndexError):
+        await prompt_world(update, context)
+        return
+    await run_near(update, context, lat, lon, radius)
+
+
+async def on_location(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    loc = update.effective_message.location if update.effective_message else None
+    if loc:
+        await run_near(update, context, loc.latitude, loc.longitude, 100)
+
+
+async def world_update(update: Update, context: ContextTypes.DEFAULT_TYPE, flight_id: int) -> None:
+    """Re-query one stored flight live (by hex, else callsign) and show it again."""
+    r = await Ctx.db.one("SELECT mode_s, callsign FROM flights WHERE id=?", (flight_id,))
+    if r and not world_throttled(context, 3.0):
+        kind, query = ("hex", r["mode_s"]) if r["mode_s"] and HEX_QUERY.match(r["mode_s"]) else (
+            "callsign", r["callsign"])
+        if query and WORLD_QUERY.match(query):
+            records, _, _ = await Ctx.api.find(kind, query)
+            if records:
+                await Ctx.db.ingest(records, "WORLD", now_utc())
+    await view_flight(update, context, flight_id)
+
+
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (update.effective_message.text or "") if update.effective_message else ""
     text = text.strip(" \t\r\n\u200e\u200f\u200b\u202a\u202b\u202c")
@@ -1913,6 +2141,8 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         context.user_data["range"] = (iso(start), iso(end), label)
         context.user_data.pop("await", None)
         await view_list(update, context, "ar", "c", 0)
+    elif mode == "world":
+        await run_world(update, context, text)
     elif mode == "search" or text:
         await run_search(update, context, text)
 
@@ -2085,8 +2315,8 @@ EXPORT_COLS = ["id", "callsign", "flight_number_iata", "airline_icao", "airline_
 
 
 async def admin_export(update: Update, days: int) -> None:
-    where, args = ("crossing_status<>'NEARBY'", ()) if days <= 0 else (
-        "last_seen_utc>=? AND crossing_status<>'NEARBY'", (iso(now_utc() - timedelta(days=days)),))
+    where, args = ("crossing_status IN ('CONFIRMED','SINGLE_OBS')", ()) if days <= 0 else (
+        "last_seen_utc>=? AND crossing_status IN ('CONFIRMED','SINGLE_OBS')", (iso(now_utc() - timedelta(days=days)),))
     rows = await Ctx.db.q(
         f"SELECT {','.join(EXPORT_COLS)} FROM flights WHERE {where} ORDER BY first_seen_utc", args)
     if not rows:
@@ -2147,7 +2377,7 @@ async def cmd_restart_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 COMMANDS: dict[str, Any] = {
     "start": cmd_start, "help": cmd_help, "last24": cmd_last24, "live": cmd_live,
-    "around": cmd_around,
+    "around": cmd_around, "world": cmd_world, "near": cmd_near,
     "search": cmd_search, "flight": cmd_flight, "airlines": cmd_airlines,
     "aircraft": cmd_aircraft, "stats": cmd_stats, "archive": cmd_archive,
     "status": cmd_status, "admin": cmd_admin, "system": cmd_system, "sync": cmd_sync,
@@ -2176,6 +2406,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 await view_main(update)
             elif target == "search":
                 await prompt_search(update, context)
+            elif target == "world":
+                await prompt_world(update, context)
             elif target == "archive":
                 await view_archive_menu(update)
             elif target == "status":
@@ -2189,6 +2421,10 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await view_list(update, context, parts[1], parts[2], int(parts[3]))
         elif head == "F":
             await view_flight(update, context, int(parts[1]))
+        elif head == "WU":
+            await world_update(update, context, int(parts[1]))
+        elif head == "W":
+            await run_world(update, context, context.user_data.get("query") or "")
         elif head == "T":
             await view_track(update, int(parts[1]), int(parts[2]))
         elif head == "A":
@@ -2320,6 +2556,7 @@ async def amain() -> int:
         app.add_handler(CommandHandler(name, handler))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    app.add_handler(MessageHandler(filters.LOCATION, on_location))
     app.add_error_handler(on_error)
 
     def polling_error(exc: TelegramError) -> None:
@@ -2337,7 +2574,9 @@ async def amain() -> int:
             await app.bot.set_my_commands([BotCommand(c, d) for c, d in [
                 ("start", "Main menu"), ("last24", "Flights in the last 24 hours"),
                 ("live", "Aircraft in Iraqi airspace now"),
-                ("around", "Aircraft around Iraq now"), ("search", "Search the archive"),
+                ("around", "Aircraft around Iraq now"),
+                ("world", "Find any aircraft worldwide (live)"),
+                ("near", "Aircraft near any point: /near lat lon"), ("search", "Search the archive"),
                 ("flight", "Open a flight by callsign / number"), ("airlines", "Airlines"),
                 ("aircraft", "Aircraft types"), ("stats", "Statistics"),
                 ("archive", "Flight archive"), ("status", "System status"), ("help", "Help")]])
