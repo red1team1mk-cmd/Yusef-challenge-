@@ -14,9 +14,16 @@ Data sources (tried in the order given by ADSB_PROVIDERS):
 All three return readsb-style aircraft objects (hex, flight, r, t, desc,
 alt_baro, gs, track, baro_rate, lat, lon, seen_pos, dbFlags, ownOp).
 
-These feeds carry live positions only: no origin/destination airports, no
-schedule times and no historical query.  Those fields are shown as N/A and the
-archive is whatever this bot has collected itself.
+These feeds carry live positions only.  Route and aircraft details are added
+from free lookup databases (class Enricher):
+    adsbdb.com   GET https://api.adsbdb.com/v0/aircraft/{mode_s}?callsign={cs}
+                 GET https://api.adsbdb.com/v0/callsign/{cs}
+    hexdb.io     GET https://hexdb.io/api/v1/route/icao/{cs}   (route fallback)
+A route found this way is the route usually flown under that callsign, taken
+from a community database.  It is NOT a live flight plan and can be wrong or
+missing.  Actual departure/arrival times are not available from any of these
+sources and are shown as N/A.  There is no historical query: the archive is
+whatever this bot has collected itself.
 
 Crossing evidence policy
 ------------------------
@@ -95,7 +102,7 @@ QUERY_CIRCLES = [(33.0, 41.6), (35.2, 44.6), (31.2, 46.0)]
 MAX_POSITION_AGE = 300  # seconds; older positions are ignored. Each position is
                         # stored with its own true timestamp (feed time - age).
 APP_NAME = "IRAQ AIR TRAFFIC MONITOR"
-APP_VERSION = "2.2.0"
+APP_VERSION = "2.3.0"
 
 # Simplified Iraq land-boundary polygon (lon, lat), clockwise from the
 # Turkey/Syria/Iraq tripoint.  Accuracy is roughly 10-20 km: flights that only
@@ -496,6 +503,239 @@ class AdsbClient:
 
 
 # --------------------------------------------------------------------------
+# ROUTE / AIRCRAFT ENRICHMENT (adsbdb.com, hexdb.io)
+# --------------------------------------------------------------------------
+def traffic_type(dep_country: Optional[str], arr_country: Optional[str]) -> str:
+    if not (dep_country and arr_country):
+        return "UNKNOWN"
+    if dep_country == "IQ" and arr_country == "IQ":
+        return "DOMESTIC"
+    if dep_country == "IQ":
+        return "DEPARTURE"
+    if arr_country == "IQ":
+        return "ARRIVAL"
+    return "OVERFLIGHT"
+
+
+ROUTE_COLS = ["airline_name", "airline_iata", "callsign_iata", "dep_icao", "dep_iata", "dep_name",
+              "dep_city", "dep_country", "arr_icao", "arr_iata", "arr_name", "arr_city", "arr_country"]
+
+
+class Enricher:
+    """Looks up the usual route of a callsign and the registry details of an
+    aircraft.  Every answer (including "unknown") is cached in SQLite, so each
+    callsign/aircraft costs at most one lookup per cache period."""
+    ADSBDB = "https://api.adsbdb.com/v0"
+    HEXDB = "https://hexdb.io/api/v1"
+    ROUTE_TTL = timedelta(days=30)
+    ROUTE_MISS_TTL = timedelta(days=3)
+    AIRCRAFT_TTL = timedelta(days=60)
+
+    def __init__(self, db: "Database") -> None:
+        self.db = db
+        self._client = httpx.AsyncClient(
+            headers={"Accept": "application/json",
+                     "User-Agent": f"iraq-air-traffic-monitor/{APP_VERSION}"},
+            timeout=httpx.Timeout(12.0, connect=6.0), follow_redirects=True)
+        self._gate = asyncio.Lock()
+        self._last_request = 0.0
+        self.paused_until: Optional[datetime] = None
+        self.lookups = 0
+        self.last_error: Optional[str] = None
+
+    async def close(self) -> None:
+        await self._client.aclose()
+
+    async def _get(self, url: str) -> tuple[int, Any]:
+        """One polite request. Returns (status, json-or-None); 0 = network failure."""
+        if self.paused_until and now_utc() < self.paused_until:
+            return 0, None
+        async with self._gate:
+            wait = 1.0 - (time.monotonic() - self._last_request)
+            if wait > 0:
+                await asyncio.sleep(wait)
+            try:
+                resp = await self._client.get(url)
+            except (httpx.TimeoutException, httpx.TransportError) as exc:
+                self.last_error = f"network error: {type(exc).__name__}"
+                return 0, None
+            finally:
+                self._last_request = time.monotonic()
+        self.lookups += 1
+        if resp.status_code == 429 or resp.status_code >= 500:
+            # Back off for a while instead of pressing a busy or limiting service.
+            self.paused_until = now_utc() + timedelta(minutes=15)
+            self.last_error = f"lookup service HTTP {resp.status_code}; paused 15 min"
+            return resp.status_code, None
+        try:
+            return resp.status_code, resp.json()
+        except ValueError:
+            return resp.status_code, None
+
+    @staticmethod
+    def _airport(a: Any, prefix: str) -> dict:
+        a = a if isinstance(a, dict) else {}
+        country = clean_str(a.get("country_iso_name"))
+        return {f"{prefix}_icao": clean_str(a.get("icao_code")), f"{prefix}_iata": clean_str(a.get("iata_code")),
+                f"{prefix}_name": clean_str(a.get("name")), f"{prefix}_city": clean_str(a.get("municipality")),
+                f"{prefix}_country": country.upper() if country else None}
+
+    def _parse_route(self, fr: Any) -> Optional[dict]:
+        if not isinstance(fr, dict):
+            return None
+        route = {**self._airport(fr.get("origin"), "dep"), **self._airport(fr.get("destination"), "arr")}
+        if not (route["dep_icao"] or route["dep_iata"]) or not (route["arr_icao"] or route["arr_iata"]):
+            return None
+        airline = fr.get("airline") if isinstance(fr.get("airline"), dict) else {}
+        route.update({"airline_name": clean_str(airline.get("name")),
+                      "airline_iata": clean_str(airline.get("iata")),
+                      "callsign_iata": clean_str(fr.get("callsign_iata")), "source": "adsbdb"})
+        return route
+
+    async def _save_route(self, callsign: str, route: Optional[dict]) -> None:
+        values = [(route or {}).get(c) for c in ROUTE_COLS]
+        await self.db.run(
+            f"INSERT OR REPLACE INTO route_cache(callsign, found, source, {','.join(ROUTE_COLS)}, fetched_utc) "
+            f"VALUES(?,?,?,{','.join('?' * len(ROUTE_COLS))},?)",
+            (callsign, 1 if route else 0, (route or {}).get("source"), *values, iso(now_utc())))
+
+    async def _save_aircraft(self, key: str, row: sqlite3.Row, ac: Any) -> None:
+        ac = ac if isinstance(ac, dict) else {}
+        stamp = iso(now_utc())
+        await self.db.run(
+            "INSERT INTO aircraft(key, registration, mode_s, type_icao, type_desc, operator_name, "
+            "manufacturer, owner_country, photo_url, detail_fetched_utc, first_seen_utc, last_seen_utc) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(key) DO UPDATE SET "
+            "registration=COALESCE(excluded.registration, registration), "
+            "mode_s=COALESCE(excluded.mode_s, mode_s), "
+            "type_icao=COALESCE(excluded.type_icao, type_icao), "
+            "type_desc=COALESCE(excluded.type_desc, type_desc), "
+            "operator_name=COALESCE(excluded.operator_name, operator_name), "
+            "manufacturer=COALESCE(excluded.manufacturer, manufacturer), "
+            "owner_country=COALESCE(excluded.owner_country, owner_country), "
+            "photo_url=COALESCE(excluded.photo_url, photo_url), "
+            "detail_fetched_utc=excluded.detail_fetched_utc",
+            (key, clean_str(ac.get("registration")) or row["registration"],
+             (clean_str(ac.get("mode_s")) or row["mode_s"] or "").upper() or None,
+             clean_str(ac.get("icao_type")), clean_str(ac.get("type")),
+             clean_str(ac.get("registered_owner")), clean_str(ac.get("manufacturer")),
+             clean_str(ac.get("registered_owner_country_name")),
+             clean_str(ac.get("url_photo")), stamp, stamp, stamp))
+
+    async def enrich(self, flight_id: int) -> None:
+        """Fill route and aircraft details for one flight. Never raises."""
+        try:
+            await self._enrich(flight_id)
+        except Exception:
+            log.exception("enrichment failed")
+
+    async def _enrich(self, flight_id: int) -> None:
+        row = await self.db.one("SELECT * FROM flights WHERE id=?", (flight_id,))
+        if not row:
+            return
+        now = now_utc()
+        callsign = row["callsign"]
+        # Only airline-style callsigns (3 letters + digit) have database routes.
+        want_route = bool(callsign and AIRLINE_CALLSIGN.match(callsign) and not row["route_checked_utc"])
+        if not want_route and not row["route_checked_utc"]:
+            # Nothing to look up (no callsign, or not an airline callsign): settle it.
+            await self.db.run("UPDATE flights SET route_checked_utc=? WHERE id=?", (iso(now), flight_id))
+        route: Optional[dict] = None
+        route_done = not want_route
+        if want_route:
+            cached = await self.db.one("SELECT * FROM route_cache WHERE callsign=?", (callsign,))
+            if cached:
+                ttl = self.ROUTE_TTL if cached["found"] else self.ROUTE_MISS_TTL
+                if now - parse_dt(cached["fetched_utc"]) < ttl:  # type: ignore[operator]
+                    route_done = True
+                    if cached["found"]:
+                        route = {c: cached[c] for c in ROUTE_COLS}
+                        route["source"] = cached["source"]
+
+        ac_id = row["mode_s"] if row["mode_s"] and not row["mode_s"].startswith("~") else row["registration"]
+        ac_key = row["registration"] or row["mode_s"]
+        want_aircraft = False
+        if ac_id and ac_key:
+            fetched = parse_dt(await self.db.scalar(
+                "SELECT detail_fetched_utc FROM aircraft WHERE key=?", (ac_key,)))
+            want_aircraft = fetched is None or now - fetched > self.AIRCRAFT_TTL
+        elif ac_key and not ac_id:
+            # Non-ICAO address and no registration: no registry lookup is possible.
+            if not await self.db.scalar("SELECT detail_fetched_utc FROM aircraft WHERE key=?", (ac_key,)):
+                await self._save_aircraft(ac_key, row, None)
+
+        asked = False  # True once a lookup service actually answered about the route
+        if want_aircraft:
+            url = f"{self.ADSBDB}/aircraft/{ac_id}"
+            if not route_done:
+                url += f"?callsign={callsign}"
+            status, data = await self._get(url)
+            resp = data.get("response") if isinstance(data, dict) else None
+            if status == 200 and isinstance(resp, dict):
+                await self._save_aircraft(ac_key, row, resp.get("aircraft"))
+                if not route_done:
+                    route = self._parse_route(resp.get("flightroute"))
+                    route_done = route is not None
+                    if route:
+                        await self._save_route(callsign, route)
+            elif status == 404:
+                await self._save_aircraft(ac_key, row, None)  # remember "unknown"
+        if not route_done:
+            status, data = await self._get(f"{self.ADSBDB}/callsign/{callsign}")
+            resp = data.get("response") if isinstance(data, dict) else None
+            if status == 200 and isinstance(resp, dict):
+                route = self._parse_route(resp.get("flightroute"))
+            asked = status in (200, 404)
+            if route is None:
+                status, data = await self._get(f"{self.HEXDB}/route/icao/{callsign}")
+                text = clean_str(data.get("route")) if isinstance(data, dict) else None
+                if status == 200 and text and text.count("-") >= 1:
+                    parts = [x.strip().upper() for x in text.split("-") if x.strip()]
+                    if len(parts) >= 2:
+                        route = {c: None for c in ROUTE_COLS}
+                        route.update({"dep_icao": parts[0], "arr_icao": parts[-1], "source": "hexdb"})
+                asked = asked or status in (200, 404)
+            if route is not None or asked:
+                await self._save_route(callsign, route)
+                route_done = True
+
+        if want_route and route_done:
+            if route:
+                dep_c, arr_c = route.get("dep_country"), route.get("arr_country")
+                await self.db.run(
+                    "UPDATE flights SET airline_name=COALESCE(?, airline_name), "
+                    "airline_iata=COALESCE(?, airline_iata), flight_number_iata=COALESCE(?, flight_number_iata), "
+                    "dep_icao=?, dep_iata=?, dep_name=?, dep_city=?, dep_country=?, "
+                    "arr_icao=?, arr_iata=?, arr_name=?, arr_city=?, arr_country=?, "
+                    "traffic_type=?, route_source=?, route_checked_utc=? WHERE id=?",
+                    (*[route.get(c) for c in ROUTE_COLS], traffic_type(dep_c, arr_c),
+                     route.get("source"), iso(now), flight_id))
+                if route.get("airline_name") and row["airline_icao"]:
+                    await self.db.run("UPDATE airlines SET name=COALESCE(name, ?), iata=COALESCE(iata, ?) "
+                                      "WHERE icao=?", (route["airline_name"], route.get("airline_iata"),
+                                                       row["airline_icao"]))
+            else:
+                await self.db.run("UPDATE flights SET route_checked_utc=? WHERE id=?", (iso(now), flight_id))
+
+    async def background(self, limit: int, stop: asyncio.Event) -> int:
+        """Enrich recent flights seen inside Iraq that have not been looked up yet."""
+        rows = await self.db.q(
+            "SELECT f.id FROM flights f LEFT JOIN aircraft a ON a.key=COALESCE(f.registration, f.mode_s) "
+            "WHERE f.crossing_status<>'NEARBY' AND f.last_seen_utc>=? AND "
+            "(f.route_checked_utc IS NULL OR "
+            " (a.key IS NOT NULL AND a.detail_fetched_utc IS NULL)) "
+            "ORDER BY f.last_seen_utc DESC LIMIT ?",
+            (iso(now_utc() - timedelta(hours=6)), limit))
+        done = 0
+        for r in rows:
+            if stop.is_set() or (self.paused_until and now_utc() < self.paused_until):
+                break
+            await self.enrich(r["id"])
+            done += 1
+        return done
+
+
+# --------------------------------------------------------------------------
 # DATABASE
 # --------------------------------------------------------------------------
 SCHEMA = """
@@ -572,6 +812,14 @@ CREATE TABLE IF NOT EXISTS api_status (
     key TEXT PRIMARY KEY, value TEXT, updated_utc TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS route_cache (
+    callsign TEXT PRIMARY KEY, found INTEGER NOT NULL, source TEXT,
+    airline_name TEXT, airline_iata TEXT, callsign_iata TEXT,
+    dep_icao TEXT, dep_iata TEXT, dep_name TEXT, dep_city TEXT, dep_country TEXT,
+    arr_icao TEXT, arr_iata TEXT, arr_name TEXT, arr_city TEXT, arr_country TEXT,
+    fetched_utc TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS runs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     started_utc TEXT NOT NULL, stopped_utc TEXT, stop_reason TEXT, deployment TEXT
@@ -622,6 +870,14 @@ class Database:
         await self.conn.execute("PRAGMA foreign_keys=ON")
         await self.conn.execute("PRAGMA busy_timeout=10000")
         await self.conn.executescript(SCHEMA)
+        # Columns added after the first release (existing databases are upgraded in place).
+        for table, column in (("flights", "route_source TEXT"), ("flights", "route_checked_utc TEXT"),
+                              ("aircraft", "manufacturer TEXT"), ("aircraft", "owner_country TEXT"),
+                              ("aircraft", "photo_url TEXT")):
+            async with self.conn.execute(f"PRAGMA table_info({table})") as cur:
+                present = {row[1] for row in await cur.fetchall()}
+            if column.split()[0] not in present:
+                await self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column}")
 
     async def close(self) -> None:
         if self.conn:
@@ -829,12 +1085,7 @@ class Database:
 
         dep_c = fields["dep_country"] or (existing["dep_country"] if existing else None)
         arr_c = fields["arr_country"] or (existing["arr_country"] if existing else None)
-        if dep_c and arr_c:
-            traffic = ("DOMESTIC" if dep_c == "IQ" and arr_c == "IQ" else
-                       "DEPARTURE" if dep_c == "IQ" else
-                       "ARRIVAL" if arr_c == "IQ" else "OVERFLIGHT")
-        else:
-            traffic = "UNKNOWN"
+        traffic = traffic_type(dep_c, arr_c)
 
         await self.conn.execute(
             "UPDATE flights SET first_seen_utc=?, last_seen_utc=?, obs_count=?, crossing_status=?, "
@@ -875,6 +1126,7 @@ class SyncService:
         self.stop = asyncio.Event()
         self.next_run: Optional[datetime] = None
         self.cycles = 0
+        self.enricher: Optional[Enricher] = None
 
     async def _record(self, trigger: str, started: datetime, status: str,
                       res: Optional[dict] = None, detail: str = "") -> dict:
@@ -937,6 +1189,10 @@ class SyncService:
         while not self.stop.is_set():
             try:
                 await self.sync_live("auto")
+                if self.enricher:
+                    done = await self.enricher.background(40, self.stop)
+                    if done:
+                        ev("enrichment", flights=done, lookups_total=self.enricher.lookups)
                 self.cycles += 1
                 if self.cycles % 50 == 1:
                     await self._maintenance()
@@ -960,6 +1216,7 @@ class Ctx:
     cfg: Config
     db: Database
     api: AdsbClient
+    enrich: Enricher
     sync: SyncService
     started: datetime
 
@@ -1058,6 +1315,12 @@ async def data_age_line() -> str:
 async def source_line() -> str:
     provider = await Ctx.db.get_status("provider")
     return f"SOURCE: {provider or 'none yet'}"
+
+
+def route(row: sqlite3.Row) -> str:
+    dep = row["dep_iata"] or row["dep_icao"]
+    arr = row["arr_iata"] or row["arr_icao"]
+    return f"{dep}→{arr}" if dep and arr else (row["registration"] or "")
 
 
 def ident(row: sqlite3.Row) -> str:
@@ -1162,7 +1425,7 @@ async def view_list(update: Update, context: ContextTypes.DEFAULT_TYPE, kind: st
     row_buf: list[InlineKeyboardButton] = []
     for i, r in enumerate(rows, start=page * PAGE_SIZE + 1):
         mark = {"CONFIRMED": "✓", "NEARBY": "○"}.get(r["crossing_status"], "?")
-        lines.append(f"{i:02d} {ident(r):<8} {r['aircraft_type'] or '----':<4} {r['registration'] or ''}")
+        lines.append(f"{i:02d} {ident(r):<8} {r['aircraft_type'] or '----':<4} {route(r)}")
         alt = f"{int(r['altitude_ft']):>5}ft" if r["altitude_ft"] is not None else "   N/A "
         lines.append(f"   {alt} {local(r['last_seen_utc'], '%d%b %H:%M')} {mark}")
         row_buf.append(btn(f"{i:02d} {ident(r)}", f"F|{r['id']}"))
@@ -1187,6 +1450,7 @@ async def view_list(update: Update, context: ContextTypes.DEFAULT_TYPE, kind: st
 
 
 async def view_flight(update: Update, context: ContextTypes.DEFAULT_TYPE, flight_id: int) -> None:
+    await Ctx.enrich.enrich(flight_id)  # cached after the first time
     r = await Ctx.db.one("SELECT * FROM flights WHERE id=?", (flight_id,))
     if not r:
         await respond(update, pre(header("FLIGHT") + ["RECORD NOT FOUND."]),
@@ -1196,7 +1460,8 @@ async def view_flight(update: Update, context: ContextTypes.DEFAULT_TYPE, flight
     def airport(prefix: str) -> str:
         parts = [r[f"{prefix}_icao"], r[f"{prefix}_iata"], r[f"{prefix}_city"] or r[f"{prefix}_name"]]
         parts = [p for p in parts if p]
-        return " ".join(parts)[:22] if parts else NA
+        text = " ".join(parts)[:22] if parts else NA
+        return f"{text} {r[f'{prefix}_country']}" if parts and r[f"{prefix}_country"] else text
 
     def when(prefix: str) -> str:
         if not r[f"{prefix}_time_utc"]:
@@ -1204,7 +1469,16 @@ async def view_flight(update: Update, context: ContextTypes.DEFAULT_TYPE, flight
         return f"{local(r[f'{prefix}_time_utc'])} {r[f'{prefix}_time_kind'][:3]}"
 
     numbers = " / ".join(x for x in (r["flight_number_iata"], r["flight_number_icao"]) if x) or NA
-    airline = f"{r['airline_icao']} (from callsign)" if r["airline_icao"] else NA
+    if r["airline_name"]:
+        airline = f"{r['airline_name']} ({r['airline_icao'] or r['airline_iata'] or '?'})"
+    else:
+        airline = f"{r['airline_icao']} (from callsign)" if r["airline_icao"] else NA
+    if r["route_source"]:
+        route_note = [f"ROUTE SRC {r['route_source']} (by callsign)", " usual route, not a live plan"]
+    elif r["route_checked_utc"]:
+        route_note = ["ROUTE     not in route database"]
+    else:
+        route_note = ["ROUTE     not looked up (no", " airline callsign / service busy)"]
     model = " ".join(x for x in (r["aircraft_type"], r["aircraft_type_desc"]) if x) or NA
     first, last = parse_dt(r["first_seen_utc"]), parse_dt(r["last_seen_utc"])
     if r["obs_count"] >= 2 and first and last:
@@ -1227,9 +1501,9 @@ async def view_flight(update: Update, context: ContextTypes.DEFAULT_TYPE, flight
         SUB,
         f"FROM  {airport('dep')}",
         f"TO    {airport('arr')}",
-        f"DEP   {when('dep')}",
-        f"ARR   {when('arr')}",
-        " (route/times: not in ADS-B)",
+        *route_note,
+        f"TRAFFIC   {r['traffic_type']}",
+        "DEP/ARR TIMES  N/A (no source)",
         SUB + ("\n AROUND IRAQ (OUTSIDE BORDER)" if nearby else "\n IRAQ AIRSPACE"),
         f"FIRST OBS {local(r['first_seen_utc'])}",
         f"LAST OBS  {local(r['last_seen_utc'])}",
@@ -1249,6 +1523,10 @@ async def view_flight(update: Update, context: ContextTypes.DEFAULT_TYPE, flight
     back = context.user_data.get("back")
     kb = [
         [btn("⌖ TRACK", f"T|{flight_id}|0"), btn("✈ AIRCRAFT INFO", f"A|{flight_id}")],
+        *([[InlineKeyboardButton(
+            "🗺 OPEN LAST POSITION ON MAP",
+            url=f"https://www.google.com/maps?q={r['latitude']:.4f},{r['longitude']:.4f}")]]
+          if r["latitude"] is not None else []),
         [btn("⟳ REFRESH", f"F|{flight_id}")] + ([btn("◀ BACK", back)] if back else []),
         menu_row(),
     ]
@@ -1298,15 +1576,21 @@ async def view_aircraft_info(update: Update, flight_id: int) -> None:
             "NO REGISTRATION OR ICAO24 ON", "RECORD. DETAILS UNAVAILABLE."]), kb)
         return
     key = r["registration"] or r["mode_s"]
+    await Ctx.enrich.enrich(flight_id)
     ac = await Ctx.db.one("SELECT * FROM aircraft WHERE key=?", (key,))
     lines = header(f"AIRCRAFT {key}")
     if ac:
+        if ac["photo_url"] and ac["photo_url"].startswith("https://"):
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton("📷 AIRCRAFT PHOTO", url=ac["photo_url"])],
+                                       [btn("◀ FLIGHT", f"F|{flight_id}")], menu_row()])
         lines += [
             f"REG       {val(ac['registration'])}",
             f"ICAO24    {val(ac['mode_s'])}",
             f"TYPE      {val(ac['type_icao'])}",
             f"MODEL     {val(ac['type_desc'])[:24]}",
+            f"MAKER     {val(ac['manufacturer'])[:24]}",
             f"OWNER/OPR {val(ac['operator_name'])[:24]}",
+            f"REG. IN   {val(ac['owner_country'])[:24]}",
             f"CLASS     {val(r['aircraft_classes'])}",
             SUB,
             f"FIRST SEEN {local(ac['first_seen_utc'], '%d %b %Y')}",
@@ -1316,7 +1600,7 @@ async def view_aircraft_info(update: Update, flight_id: int) -> None:
             "SELECT COUNT(*) FROM flights WHERE registration=? OR mode_s=?",
             (ac["registration"] or "-", ac["mode_s"] or "-"))
         lines += [f"RECORDS    {seen} in archive", SUB,
-                  "From the ADS-B feed's aircraft", "database. N/A = not provided."]
+                  "From ADS-B feed + adsbdb registry.", "N/A = not provided."]
     else:
         lines.append("NO STORED AIRCRAFT DATA.")
     await respond(update, pre(lines), kb)
@@ -1391,7 +1675,11 @@ async def view_stats(update: Update, days: int) -> None:
 
         await top("airline_icao", "TOP AIRLINES")
         await top("aircraft_type", "TOP AIRCRAFT")
-        lines += [SUB, "ORIGIN / DESTINATION", " N/A: not provided by ADS-B feeds"]
+        await top("dep_icao", "TOP ORIGINS")
+        await top("arr_icao", "TOP DESTINATIONS")
+        kinds = await db.q(
+            f"SELECT traffic_type k, COUNT(*) n FROM flights WHERE {base} GROUP BY k ORDER BY n DESC", args)
+        lines += [SUB, "TRAFFIC MIX"] + [f" {k['k']:<11}{k['n']:>6}" for k in kinds]
 
         firsts = await db.q(f"SELECT first_seen_utc FROM flights WHERE {base}", args)
         hours = [0] * 24
@@ -1418,7 +1706,7 @@ async def view_stats(update: Update, days: int) -> None:
             return f"{round(100 * n / total):>3}%"
         lines += [SUB, "DATA COMPLETENESS",
                   f" airline {pct(row['ha'])}  type  {pct(row['ht'])}",
-                  " airline = inferred from callsign"]
+                  f" route   {pct(row['hd'])}  (by callsign DB)"]
     coverage = await db.scalar("SELECT MIN(first_seen_utc) FROM flights WHERE crossing_status<>'NEARBY'")
     lines.append(SUB)
     if coverage:
@@ -1538,8 +1826,8 @@ async def prompt_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     context.user_data["await"] = "search"
     lines = header("SEARCH FLIGHT") + [
         "SEND A SEARCH TERM:", SUB,
-        "callsign      QTR8K", "registration  A7-ALA", "airline code  UAE",
-        "aircraft      B77W", "ICAO24 hex    06A1E5"]
+        "callsign      QTR8K", "registration  A7-ALA", "airline       Emirates / UAE",
+        "aircraft      B77W", "airport       ORBI / BGW / Dubai", "ICAO24 hex    06A1E5"]
     await respond(update, pre(lines), InlineKeyboardMarkup([menu_row()]))
 
 
@@ -1685,6 +1973,8 @@ async def admin_system(update: Update) -> None:
         f"LAST OK   {ago(iso(api.last_ok)) if api.last_ok else NA}",
         f"LATENCY   {val(api.last_latency_ms, ' ms')}",
         f"LAST ERR  {(api.last_error or 'none')[:60]}",
+        f"LOOKUPS   {Ctx.enrich.lookups} route/aircraft",
+        f"LOOKUP ERR {(Ctx.enrich.last_error or 'none')[:50]}",
         "(use SYNC NOW to test the feed)",
         SUB,
         f"SYNC TASK {'RUNNING' if not Ctx.sync.stop.is_set() else 'STOPPING'}",
@@ -1786,7 +2076,9 @@ async def admin_restart_info(update: Update) -> None:
     await respond(update, pre(lines), admin_kb())
 
 
-EXPORT_COLS = ["id", "callsign", "airline_icao", "aircraft_type", "aircraft_type_desc",
+EXPORT_COLS = ["id", "callsign", "flight_number_iata", "airline_icao", "airline_name",
+               "dep_icao", "dep_iata", "dep_city", "dep_country", "arr_icao", "arr_iata", "arr_city",
+               "arr_country", "route_source", "traffic_type", "aircraft_type", "aircraft_type_desc",
                "aircraft_classes", "registration", "mode_s",
                "first_seen_utc", "last_seen_utc", "obs_count", "crossing_status",
                "altitude_ft", "ground_speed_kt", "heading", "latitude", "longitude", "data_source"]
@@ -2014,8 +2306,11 @@ async def amain() -> int:
         return 2
 
     api = AdsbClient(cfg.providers)
+    enricher = Enricher(db)
     sync = SyncService(cfg, db, api)
     sync.stop = stop
+    sync.enricher = enricher
+    Ctx.enrich = enricher
     Ctx.cfg, Ctx.db, Ctx.api, Ctx.sync, Ctx.started = cfg, db, api, sync, now_utc()
     run_id = await db.run("INSERT INTO runs(started_utc, deployment) VALUES(?,?)",
                           (iso(Ctx.started), os.getenv("RAILWAY_DEPLOYMENT_ID")))
@@ -2069,7 +2364,7 @@ async def amain() -> int:
                 task.cancel()
         for step in (lambda: app.updater.stop() if app.updater and app.updater.running else None,
                      lambda: app.stop() if app.running else None,
-                     app.shutdown, api.close):
+                     app.shutdown, api.close, enricher.close):
             try:
                 result = step()
                 if asyncio.iscoroutine(result):
