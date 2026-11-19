@@ -166,6 +166,7 @@ What is and is not verified:
 6. **Add variables.** `TELEGRAM_BOT_TOKEN` and `ADMIN_IDS`.
 7. **Make the bot an admin of the channel** (see above).
 8. **Deploy and check logs** for `mini app online`, `bot online` and `sync finished` with `"status": "OK"`.
+9. Railway uses `/healthz` for the web-service health check. Keep `WEBAPP_ENABLED=true` (the default) so the console and health endpoint listen on Railway's `PORT`.
 
 Upgrading from an earlier version: replace `main.py`, `requirements.txt` and `railway.json`, then generate a domain. The existing database is upgraded in place on first start; nothing is deleted.
 

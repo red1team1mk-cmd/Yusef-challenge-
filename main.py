@@ -65,6 +65,7 @@ import sqlite3
 import sys
 import time
 import urllib.parse
+import gzip
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 from zoneinfo import ZoneInfo
@@ -1069,6 +1070,7 @@ CREATE INDEX IF NOT EXISTS ix_flights_callsign ON flights(callsign);
 CREATE INDEX IF NOT EXISTS ix_flights_reg ON flights(registration);
 CREATE INDEX IF NOT EXISTS ix_flights_airline ON flights(airline_icao);
 CREATE INDEX IF NOT EXISTS ix_flights_type ON flights(aircraft_type);
+CREATE INDEX IF NOT EXISTS ix_flights_status_seen ON flights(crossing_status, last_seen_utc DESC);
 
 CREATE TABLE IF NOT EXISTS track_observations (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1192,6 +1194,10 @@ class Database:
         await self.conn.execute("PRAGMA synchronous=NORMAL")
         await self.conn.execute("PRAGMA foreign_keys=ON")
         await self.conn.execute("PRAGMA busy_timeout=10000")
+        await self.conn.execute("PRAGMA cache_size=-32768")
+        await self.conn.execute("PRAGMA temp_store=MEMORY")
+        await self.conn.execute("PRAGMA mmap_size=67108864")
+        await self.conn.execute("PRAGMA wal_autocheckpoint=1000")
         await self.conn.executescript(SCHEMA)
         # Columns added after the first release (existing databases are upgraded in place).
         for table, column in (("flights", "route_source TEXT"), ("flights", "route_checked_utc TEXT"),
@@ -2551,7 +2557,7 @@ def progress_block(lang: str, r: sqlite3.Row) -> list[str]:
     return out
 
 
-async def quick_enrich(flight_id: int, seconds: float = 7.0) -> None:
+async def quick_enrich(flight_id: int, seconds: float = 3.0) -> None:
     """Route/aircraft lookup for a page being opened, bounded so the user never waits
     long.  Whatever was fetched is cached; the rest is picked up on the next open."""
     try:
@@ -4028,6 +4034,7 @@ class WebApi:
         self.cfg, self.bot = cfg, bot
         self.member_cache: dict[int, dict] = {}
         self.hits: dict[int, list[float]] = {}
+        self._cache_cleanup_last = 0.0
         self.runner: Optional[web.AppRunner] = None
 
     # ---------------------------------------------------------------- plumbing
@@ -4058,6 +4065,16 @@ class WebApi:
     @web.middleware
     async def middleware(self, request: web.Request, handler: Any) -> web.StreamResponse:
         if request.path.startswith("/api/"):
+            now = time.monotonic()
+            if now - self._cache_cleanup_last > 60:
+                self._cache_cleanup_last = now
+                for uid, stamps in list(self.hits.items()):
+                    self.hits[uid] = [t for t in stamps if now - t < WEB_RATE[1]]
+                    if not self.hits[uid]:
+                        del self.hits[uid]
+                for uid, cache in list(self.member_cache.items()):
+                    if cache.get("sub_ok_until", 0) <= now and cache.get("sub_no_until", 0) <= now:
+                        del self.member_cache[uid]
             auth = verify_init_data(request.headers.get("X-Init-Data", ""), self.cfg.bot_token)
             if auth is None:
                 return self.error(401, "auth")
@@ -4083,6 +4100,17 @@ class WebApi:
             resp = self.error(500, "internal")
         for key, value in WEB_SECURITY_HEADERS.items():
             resp.headers.setdefault(key, value)
+        accept_encoding = request.headers.get("Accept-Encoding", "")
+        if ("gzip" in accept_encoding.lower()
+                and getattr(resp, "body", None)
+                and len(resp.body) >= 1024
+                and not resp.headers.get("Content-Encoding")):
+            compressed = gzip.compress(resp.body, compresslevel=6, mtime=0)
+            if len(compressed) < len(resp.body):
+                resp.body = compressed
+                resp.headers["Content-Encoding"] = "gzip"
+                resp.headers["Vary"] = "Accept-Encoding"
+                resp.headers["Content-Length"] = str(len(compressed))
         return resp
 
     @staticmethod
@@ -4111,7 +4139,9 @@ class WebApi:
                             headers={"Cache-Control": "no-cache"})
 
     async def health(self, request: web.Request) -> web.Response:
-        return web.json_response({"ok": True, "version": APP_VERSION})
+        return web.json_response(
+            {"ok": True, "version": APP_VERSION},
+            headers={"Cache-Control": "no-store"})
 
     async def bootstrap(self, request: web.Request) -> web.Response:
         cfg = self.cfg
@@ -4963,12 +4993,16 @@ function tick() {
 }
 
 /* ---------------------------------------------------------------- live data */
+let liveLoading = false;
 async function loadLive() {
+  if (liveLoading) return;
+  liveLoading = true;
   try {
     state.live = await api("/api/live");
     if (state.selected && !state.live.targets.some(t => t.id === state.selected)) state.selected = null;
     draw(); renderPick(); if (state.view === "strips" && !state.results) renderStrips(); tick();
   } catch (e) { if (e instanceof ApiError && (e.status === 401 || e.status === 403)) handleErr(e); }
+  finally { liveLoading = false; }
 }
 /* Dead reckoning between syncs: positions move along heading at ground speed,
    capped at 6 minutes, and are drawn as hollow "coasting" tracks after 90 s. */
