@@ -49,6 +49,8 @@ from __future__ import annotations
 import asyncio
 import csv
 import fcntl
+import hashlib
+import hmac
 import html
 import io
 import json
@@ -62,18 +64,22 @@ import signal
 import sqlite3
 import sys
 import time
+import urllib.parse
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 from zoneinfo import ZoneInfo
 
 import aiosqlite
 import httpx
+from aiohttp import web
 from telegram import (
     BotCommand,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     LinkPreviewOptions,
+    MenuButtonWebApp,
     Update,
+    WebAppInfo,
 )
 from telegram.constants import ParseMode
 from telegram.error import BadRequest, Conflict, Forbidden, RetryAfter, TelegramError
@@ -131,7 +137,7 @@ WORLD_LIST_LIMIT = 40
 MAX_POSITION_AGE = 300  # seconds; older positions are ignored. Each position is
                         # stored with its own true timestamp (feed time - age).
 APP_NAME = "IRAQ AIR TRAFFIC MONITOR"
-APP_VERSION = "3.1.0"
+APP_VERSION = "4.0.0"
 
 # Simplified Iraq land-boundary polygon (lon, lat), clockwise from the
 # Turkey/Syria/Iraq tripoint.  Accuracy is roughly 10-20 km: flights that only
@@ -246,6 +252,18 @@ class Config:
         self.dev_username = (os.getenv("DEV_USERNAME", "").strip() or "krofullpower").lstrip("@")
         self.channel = (os.getenv("REQUIRED_CHANNEL", "").strip() or "dlxfullpower").lstrip("@")
         self.force_sub = os.getenv("FORCE_SUBSCRIBE", "true").strip().lower() in ("1", "true", "yes", "on")
+
+        # Mini App (web console).  Railway sets PORT and, once a domain is generated,
+        # RAILWAY_PUBLIC_DOMAIN (https://docs.railway.com/reference/variables).
+        self.webapp_enabled = os.getenv("WEBAPP_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
+        self.port = self._int("PORT", 8080, 1, errors)
+        url = os.getenv("WEBAPP_URL", "").strip().rstrip("/")
+        domain = os.getenv("RAILWAY_PUBLIC_DOMAIN", "").strip()
+        if not url and domain:
+            url = f"https://{domain}"
+        if url and not url.startswith("https://"):
+            errors.append("WEBAPP_URL must start with https:// (Telegram opens Mini Apps over HTTPS only)")
+        self.webapp_url = (url + "/") if url else ""
 
         if errors:
             raise ConfigError("; ".join(errors))
@@ -1612,6 +1630,11 @@ TXT: dict[str, tuple[str, str]] = {
         "القناة"),
     "b_menu": ("MAIN MENU",
         "القائمة الرئيسية"),
+    "b_console": ("OPEN CONSOLE", "فتح المنظومة"),
+    "console_txt": ("Live scope, target files and traffic analytics in one console.",
+                    "الرادار الحي وملفات الأهداف وتحليلات الحركة في واجهة واحدة."),
+    "console_off": ("The web console is not configured on this server.",
+                    "الواجهة غير مفعّلة على هذا الخادم."),
     "dev": ("Developer", "المطوّر"),
     "channel": ("Channel", "القناة"),
     "b_back": ("‹ BACK",
@@ -2137,10 +2160,16 @@ def credit_row(lang: str) -> list[InlineKeyboardButton]:
             url_btn(tr(lang, "b_channel"), f"https://t.me/{Ctx.cfg.channel}")]
 
 
+def console_btn(lang: str) -> Optional[InlineKeyboardButton]:
+    url = Ctx.cfg.webapp_url if Ctx.cfg.webapp_enabled else ""
+    return InlineKeyboardButton(tr(lang, "b_console"), web_app=WebAppInfo(url), style="primary") if url else None
+
+
 def main_menu_kb(lang: str) -> InlineKeyboardMarkup:
     def b(key: str, data: str, style: Optional[str] = None) -> InlineKeyboardButton:
         return btn(tr(lang, key), data, style)
-    return InlineKeyboardMarkup([
+    console = console_btn(lang)
+    return InlineKeyboardMarkup(([[console]] if console else []) + [
         [b("b_live", "L|live|-|0", "primary"), b("b_near", "L|near|-|0", "primary")],
         [b("b_24h", "L|24h|-|0"), b("b_archive", "M|archive")],
         [b("b_search", "M|search"), b("b_world", "M|world")],
@@ -2202,21 +2231,21 @@ def nearest_city(lang: str, lat: float, lon: float) -> str:
 # --------------------------------------------------------------------------
 # ACCESS GATE: USER RECORD, LANGUAGE QUESTION, MANDATORY CHANNEL SUBSCRIPTION
 # --------------------------------------------------------------------------
-async def is_subscribed(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> bool:
+async def member_ok(bot: Any, user_id: int, cache: dict) -> bool:
     """True if the user is in the required channel. The bot must be an administrator
     of that channel for Telegram to answer; if it is not, access is allowed and the
-    problem is reported in the logs and in /system instead of locking everyone out."""
+    problem is reported in the logs and in /system instead of locking everyone out.
+    `cache` is a per-user dict (the bot's user_data, or the web console's own)."""
     cfg = Ctx.cfg
     if not (cfg.force_sub and cfg.channel) or user_id in cfg.admin_ids:
         return True
-    ud = context.user_data
     now = time.monotonic()
-    if ud.get("sub_ok_until", 0) > now:
+    if cache.get("sub_ok_until", 0) > now:
         return True
-    if ud.get("sub_no_until", 0) > now:
+    if cache.get("sub_no_until", 0) > now:
         return False
     try:
-        member = await context.bot.get_chat_member(f"@{cfg.channel}", user_id)
+        member = await bot.get_chat_member(f"@{cfg.channel}", user_id)
     except (BadRequest, Forbidden) as exc:
         Ctx.sub_error = f"{type(exc).__name__}: {exc}"
         if now - Ctx.sub_error_logged > 600:
@@ -2231,10 +2260,14 @@ async def is_subscribed(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> boo
     ok = status in ("member", "administrator", "creator", "owner") or (
         status == "restricted" and bool(getattr(member, "is_member", False)))
     if ok:
-        ud["sub_ok_until"] = now + 600
+        cache["sub_ok_until"] = now + 600
     else:
-        ud["sub_no_until"] = now + 3
+        cache["sub_no_until"] = now + 3
     return ok
+
+
+async def is_subscribed(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> bool:
+    return await member_ok(context.bot, user_id, context.user_data)
 
 
 async def view_lang(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3085,6 +3118,16 @@ async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await view_settings(update, context)
 
 
+async def cmd_console(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    lang = lg(context)
+    console = console_btn(lang)
+    if not console:
+        await respond(update, note(lang, tr(lang, "console_off")), InlineKeyboardMarkup([menu_row(lang)]))
+        return
+    await respond(update, "\n".join([head("WEB", tr(lang, "b_console")), line(lang, tr(lang, "console_txt"))]),
+                  InlineKeyboardMarkup([[console], menu_row(lang)]))
+
+
 async def cmd_last24(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await view_list(update, context, "24h", "-", 0)
 
@@ -3652,7 +3695,7 @@ async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 COMMANDS: dict[str, Any] = {
-    "start": cmd_start, "menu": cmd_start, "help": cmd_help, "about": cmd_about, "lang": cmd_lang,
+    "start": cmd_start, "menu": cmd_start, "console": cmd_console, "help": cmd_help, "about": cmd_about, "lang": cmd_lang,
     "settings": cmd_settings, "last24": cmd_last24, "live": cmd_live, "around": cmd_around,
     "world": cmd_world, "near": cmd_near, "search": cmd_search, "flight": cmd_flight,
     "airlines": cmd_airlines, "aircraft": cmd_aircraft, "stats": cmd_stats, "archive": cmd_archive,
@@ -3666,6 +3709,7 @@ COMMANDS: dict[str, Any] = {
 # (command, English description, Arabic description) shown in Telegram's command menu
 MENU_COMMANDS = [
     ("start", "Main menu", "القائمة الرئيسية"),
+    ("console", "Open the web console", "فتح الواجهة"),
     ("live", "Aircraft over Iraq now", "الطائرات فوق العراق الآن"),
     ("around", "Aircraft around Iraq", "الطائرات حول العراق"),
     ("last24", "Iraq flights, last 24 hours", "رحلات العراق خلال 24 ساعة"),
@@ -3895,6 +3939,391 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # --------------------------------------------------------------------------
+# MINI APP: WEB SERVER AND JSON API
+# --------------------------------------------------------------------------
+# The Mini App is one HTML page (WEBAPP_HTML, end of this file) served by the
+# same process as the bot.  Every /api request carries Telegram.WebApp.initData
+# in the X-Init-Data header; it is verified with the bot token before anything
+# is read, and the same channel-subscription rule as the bot is applied.
+# Validation: https://core.telegram.org/bots/webapps#validating-data-received-via-the-mini-app
+#   secret_key = HMAC_SHA256(key="WebAppData", msg=bot_token)
+#   hash       = hex(HMAC_SHA256(key=secret_key, msg=data_check_string))
+#   data_check_string = "key=value" pairs except hash, sorted by key, joined by "\n"
+INIT_DATA_MAX_AGE = 24 * 3600
+WEB_RATE = (40, 10.0)          # at most 40 API requests per 10 s per user
+WEB_SECURITY_HEADERS = {
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "no-referrer",
+    "Content-Security-Policy": (
+        "default-src 'self'; script-src 'self' 'unsafe-inline' https://telegram.org; "
+        "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
+        "font-src https://fonts.gstatic.com; img-src 'self' data:; connect-src 'self'; "
+        "frame-ancestors 'self' https://web.telegram.org https://*.telegram.org"),
+}
+
+
+def verify_init_data(raw: str, bot_token: str, now: Optional[float] = None) -> Optional[dict]:
+    """Return the parsed init data if its signature is valid and fresh, else None."""
+    if not raw or len(raw) > 8192:
+        return None
+    try:
+        pairs = urllib.parse.parse_qsl(raw, keep_blank_values=True, strict_parsing=True)
+    except ValueError:
+        return None
+    data = dict(pairs)
+    received = data.get("hash", "")
+    if not re.fullmatch(r"[0-9a-f]{64}", received):
+        return None
+    secret = hmac.new(b"WebAppData", bot_token.encode(), hashlib.sha256).digest()
+
+    def digest(exclude: set[str]) -> str:
+        check = "\n".join(f"{k}={v}" for k, v in sorted(data.items()) if k not in exclude)
+        return hmac.new(secret, check.encode(), hashlib.sha256).hexdigest()
+
+    # Newer clients also send a "signature" field (for third-party validation). Telegram's
+    # page and client libraries disagree on whether it is part of the string, so both
+    # forms are accepted; each is still an HMAC keyed with the bot token.
+    if not (hmac.compare_digest(digest({"hash"}), received)
+            or hmac.compare_digest(digest({"hash", "signature"}), received)):
+        return None
+    try:
+        auth_date = int(data.get("auth_date", "0"))
+    except ValueError:
+        return None
+    if abs((now or time.time()) - auth_date) > INIT_DATA_MAX_AGE:
+        return None
+    try:
+        user = json.loads(data.get("user", "{}"))
+    except ValueError:
+        return None
+    if not isinstance(user, dict) or not isinstance(user.get("id"), int):
+        return None
+    data["user"] = user
+    return data
+
+
+def jrow(row: Optional[sqlite3.Row], keys: Optional[list[str]] = None) -> Optional[dict]:
+    if row is None:
+        return None
+    return {k: row[k] for k in (keys or row.keys())}
+
+
+STATUS_CODE = {"CONFIRMED": "CNF", "SINGLE_OBS": "1OB", "NEARBY": "PRM", "WORLD": "GLB"}
+
+
+def target_brief(r: sqlite3.Row) -> dict:
+    return {
+        "id": r["id"], "cs": ident(r), "reg": r["registration"], "hex": r["mode_s"],
+        "type": r["aircraft_type"], "st": STATUS_CODE.get(r["crossing_status"], "1OB"),
+        "lat": r["latitude"], "lon": r["longitude"], "alt": r["altitude_ft"],
+        "gs": r["ground_speed_kt"], "hdg": r["heading"], "vr": r["vertical_rate"],
+        "sq": r["squawk"], "emg": is_emergency(r),
+        "dep": r["dep_iata"] or r["dep_icao"], "arr": r["arr_iata"] or r["arr_icao"],
+        "op": r["airline_name"] or r["airline_icao"], "seen": r["last_seen_utc"],
+    }
+
+
+class WebApi:
+    def __init__(self, cfg: Config, bot: Any) -> None:
+        self.cfg, self.bot = cfg, bot
+        self.member_cache: dict[int, dict] = {}
+        self.hits: dict[int, list[float]] = {}
+        self.runner: Optional[web.AppRunner] = None
+
+    # ---------------------------------------------------------------- plumbing
+    def build(self) -> web.Application:
+        app = web.Application(middlewares=[self.middleware], client_max_size=64 * 1024)
+        app.router.add_get("/", self.index)
+        app.router.add_get("/healthz", self.health)
+        app.router.add_get("/api/bootstrap", self.bootstrap)
+        app.router.add_get("/api/live", self.live)
+        app.router.add_get("/api/flight/{id:[0-9]{1,9}}", self.flight)
+        app.router.add_get("/api/stats", self.stats)
+        app.router.add_get("/api/system", self.system)
+        app.router.add_get("/api/search", self.search)
+        app.router.add_post("/api/watch", self.watch)
+        return app
+
+    async def start(self) -> None:
+        self.runner = web.AppRunner(self.build(), access_log=None)
+        await self.runner.setup()
+        site = web.TCPSite(self.runner, host="0.0.0.0", port=self.cfg.port)
+        await site.start()
+        ev("mini app online", port=self.cfg.port, url=self.cfg.webapp_url)
+
+    async def stop(self) -> None:
+        if self.runner:
+            await self.runner.cleanup()
+
+    @web.middleware
+    async def middleware(self, request: web.Request, handler: Any) -> web.StreamResponse:
+        if request.path.startswith("/api/"):
+            auth = verify_init_data(request.headers.get("X-Init-Data", ""), self.cfg.bot_token)
+            if auth is None:
+                return self.error(401, "auth")
+            uid = auth["user"]["id"]
+            stamps = [t for t in self.hits.get(uid, []) if time.monotonic() - t < WEB_RATE[1]]
+            if len(stamps) >= WEB_RATE[0]:
+                return self.error(429, "rate")
+            stamps.append(time.monotonic())
+            self.hits[uid] = stamps
+            if not await member_ok(self.bot, uid, self.member_cache.setdefault(uid, {})):
+                resp = self.error(403, "subscribe")
+                resp.text = json.dumps({"error": "subscribe", "channel": self.cfg.channel})
+                return resp
+            request["uid"] = uid
+            request["tg_user"] = auth["user"]
+            request["lang"] = await self.user_lang(uid, auth["user"])
+        try:
+            resp = await handler(request)
+        except web.HTTPException as exc:
+            resp = exc
+        except Exception:
+            log.exception("mini app request failed", extra={"data": {"path": request.path}})
+            resp = self.error(500, "internal")
+        for key, value in WEB_SECURITY_HEADERS.items():
+            resp.headers.setdefault(key, value)
+        return resp
+
+    @staticmethod
+    def error(status: int, code: str) -> web.Response:
+        return web.json_response({"error": code}, status=status)
+
+    @staticmethod
+    def ok(payload: Any) -> web.Response:
+        return web.json_response(payload, headers={"Cache-Control": "no-store"},
+                                 dumps=lambda o: json.dumps(o, ensure_ascii=False, default=str))
+
+    async def user_lang(self, uid: int, tg_user: dict) -> str:
+        saved = await Ctx.db.scalar("SELECT lang FROM users WHERE user_id=?", (uid,))
+        if saved in ("ar", "en"):
+            return saved
+        lang = "ar" if str(tg_user.get("language_code") or "").lower().startswith("ar") else "en"
+        stamp = iso(now_utc())
+        await Ctx.db.run(
+            "INSERT OR IGNORE INTO users(user_id, username, lang, first_seen_utc, last_seen_utc) "
+            "VALUES(?,?,?,?,?)", (uid, clean_str(tg_user.get("username")), lang, stamp, stamp))
+        return lang
+
+    # ---------------------------------------------------------------- pages
+    async def index(self, request: web.Request) -> web.Response:
+        return web.Response(text=WEBAPP_HTML, content_type="text/html", charset="utf-8",
+                            headers={"Cache-Control": "no-cache"})
+
+    async def health(self, request: web.Request) -> web.Response:
+        return web.json_response({"ok": True, "version": APP_VERSION})
+
+    async def bootstrap(self, request: web.Request) -> web.Response:
+        cfg = self.cfg
+        return self.ok({
+            "version": APP_VERSION, "lang": request["lang"], "admin": request["uid"] in cfg.admin_ids,
+            "tz": cfg.tz_name, "interval": cfg.sync_interval, "channel": cfg.channel,
+            "dev": cfg.dev_username,
+            "border": [[lat, lon] for lon, lat in IRAQ_POLYGON],
+            "cities": [{"en": c[0], "ar": c[1], "lat": c[2], "lon": c[3]} for c in IRAQ_CITIES],
+            "circles": [[lat, lon] for lat, lon in QUERY_CIRCLES], "radius_nm": QUERY_RADIUS_NM,
+            "sources": [PROVIDERS[p][0] for p in cfg.providers],
+        })
+
+    async def live(self, request: web.Request) -> web.Response:
+        db = Ctx.db
+        cut = live_cut()
+        rows = await db.q(
+            f"SELECT * FROM flights WHERE last_seen_utc>=? AND {REGION_ZONE} "
+            "AND latitude IS NOT NULL ORDER BY last_seen_utc DESC LIMIT 400", (cut,))
+        ids = [r["id"] for r in rows]
+        trails: dict[int, list] = {}
+        if ids:
+            marks = ",".join("?" * len(ids))
+            for o in await db.q(
+                    f"SELECT flight_id, ts_utc, latitude, longitude FROM track_observations "
+                    f"WHERE flight_id IN ({marks}) AND ts_utc>=? ORDER BY ts_utc",
+                    (*ids, iso(now_utc() - timedelta(minutes=40)))):
+                trails.setdefault(o["flight_id"], []).append([round(o["latitude"], 4), round(o["longitude"], 4)])
+        last = await db.one("SELECT finished_utc, status FROM sync_history ORDER BY id DESC LIMIT 1")
+        last_ok = await db.scalar("SELECT MAX(finished_utc) FROM sync_history WHERE status='OK'")
+        targets = []
+        for r in rows:
+            item = target_brief(r)
+            item["trail"] = trails.get(r["id"], [])[-12:]
+            targets.append(item)
+        return self.ok({
+            "now": iso(now_utc()), "last_ok": last_ok, "last_status": last["status"] if last else None,
+            "interval": self.cfg.sync_interval,
+            "sources": [x.strip() for x in (await db.get_status("provider") or "").split(",") if x.strip()],
+            "targets": targets,
+        })
+
+    async def flight(self, request: web.Request) -> web.Response:
+        lang = request["lang"]
+        flight_id = int(request.match_info["id"])
+        await quick_enrich(flight_id)
+        db = Ctx.db
+        r = await db.one("SELECT * FROM flights WHERE id=?", (flight_id,))
+        if not r:
+            return self.error(404, "not_found")
+        key = r["registration"] or r["mode_s"]
+        ac = await db.one("SELECT * FROM aircraft WHERE key=?", (key,)) if key else None
+        track = [[o["ts_utc"], o["latitude"], o["longitude"], o["altitude_ft"], o["ground_speed_kt"],
+                  o["heading"], o["in_iraq"]]
+                 for o in await db.q(
+                     "SELECT * FROM track_observations WHERE flight_id=? ORDER BY ts_utc DESC LIMIT 500",
+                     (flight_id,))][::-1]
+        progress = None
+        if None not in (r["dep_lat"], r["dep_lon"], r["arr_lat"], r["arr_lon"], r["latitude"], r["longitude"]):
+            flown = dist_nm(r["dep_lat"], r["dep_lon"], r["latitude"], r["longitude"])
+            remaining = dist_nm(r["latitude"], r["longitude"], r["arr_lat"], r["arr_lon"])
+            if flown + remaining >= 20:
+                eta = None
+                seen = parse_dt(r["last_seen_utc"])
+                if r["ground_speed_kt"] and r["ground_speed_kt"] > 80 and seen and \
+                        (now_utc() - seen).total_seconds() < 1800:
+                    eta = iso(seen + timedelta(hours=remaining / r["ground_speed_kt"]))
+                progress = {"flown": round(flown), "remaining": round(remaining),
+                            "pct": round(100 * flown / (flown + remaining)), "eta": eta,
+                            "dep": [r["dep_lat"], r["dep_lon"]], "arr": [r["arr_lat"], r["arr_lon"]]}
+        recent = [{"id": f["id"], "cs": ident(f), "st": STATUS_CODE.get(f["crossing_status"], "1OB"),
+                   "route": route(f), "seen": f["last_seen_utc"]}
+                  for f in await db.q(
+                      "SELECT * FROM flights WHERE (registration=? OR mode_s=?) AND id<>? "
+                      "ORDER BY last_seen_utc DESC LIMIT 8",
+                      (r["registration"] or "-", r["mode_s"] or "-", flight_id))]
+        watch_id = r["callsign"] or r["registration"] or r["mode_s"]
+        watching = bool(watch_id and await db.scalar(
+            "SELECT 1 FROM watch WHERE user_id=? AND ident=?", (request["uid"], watch_id)))
+        cat = CATEGORIES.get((r["category"] or "").upper())
+        out = {k: r[k] for k in (
+            "id", "callsign", "flight_number_iata", "airline_icao", "airline_name", "aircraft_type",
+            "aircraft_type_desc", "registration", "mode_s", "dep_icao", "dep_iata", "dep_name", "dep_city",
+            "dep_country", "arr_icao", "arr_iata", "arr_name", "arr_city", "arr_country", "route_source",
+            "route_checked_utc", "first_seen_utc", "last_seen_utc", "obs_count", "altitude_ft", "alt_geom_ft",
+            "ground_speed_kt", "heading", "vertical_rate", "squawk", "mach", "ias_kt", "tas_kt",
+            "nav_altitude_ft", "nav_heading", "wind_dir", "wind_kt", "oat_c", "latitude", "longitude",
+            "category", "aircraft_classes", "origin_country", "data_source", "updated_utc")}
+        out.update({
+            "cs": ident(r), "st": STATUS_CODE.get(r["crossing_status"], "1OB"), "emg": is_emergency(r),
+            "status_text": pick(lang, STATUS_TXT.get(r["crossing_status"], STATUS_TXT["SINGLE_OBS"])),
+            "traffic": (pick(lang, TRAFFIC.get(r["traffic_type"], TRAFFIC["UNKNOWN"]))
+                        if r["route_source"] and r["crossing_status"] in ("CONFIRMED", "SINGLE_OBS") else None),
+            "category_text": pick(lang, cat) if cat else None,
+            "pos_source": POS_SOURCES.get(r["pos_source"] or "", r["pos_source"]),
+            "near": (nearest_city(lang, r["latitude"], r["longitude"])
+                     if r["latitude"] is not None and r["crossing_status"] != "WORLD" else None),
+            "compass": compass(lang, r["heading"]) if r["heading"] is not None else None,
+            "squawk_text": (tr(lang, {"7500": "sq_7500", "7600": "sq_7600", "7700": "sq_7700",
+                                      "1200": "sq_vfr", "7000": "sq_vfr"}[r["squawk"]])
+                            if r["squawk"] in ("7500", "7600", "7700", "1200", "7000") else None),
+            "aircraft": jrow(ac, ["registration", "mode_s", "type_icao", "type_desc", "manufacturer",
+                                  "operator_name", "owner_country", "photo_url", "first_seen_utc",
+                                  "last_seen_utc"]) if ac else None,
+            "progress": progress, "track": track, "recent": recent, "watching": watching,
+        })
+        return self.ok(out)
+
+    async def stats(self, request: web.Request) -> web.Response:
+        db = Ctx.db
+        try:
+            days = max(0, min(365, int(request.query.get("days", "1"))))
+        except ValueError:
+            days = 1
+        since = iso(now_utc() - timedelta(days=days)) if days else "0000"
+        base = "last_seen_utc>=? AND crossing_status='CONFIRMED'"
+        args = (since,)
+        total = await db.scalar(f"SELECT COUNT(*) FROM flights WHERE {base}", args) or 0
+        single = await db.scalar(
+            "SELECT COUNT(*) FROM flights WHERE last_seen_utc>=? AND crossing_status='SINGLE_OBS'", args) or 0
+        agg = await db.one(
+            f"SELECT COUNT(DISTINCT airline_icao) a, COUNT(DISTINCT aircraft_type) t, COUNT(airline_icao) ha, "
+            f"COUNT(aircraft_type) ht, COUNT(dep_icao) hd FROM flights WHERE {base}", args)
+
+        async def top(col: str, name_col: str) -> list:
+            return [{"code": x["c"], "name": x["nm"], "n": x["n"]} for x in await db.q(
+                f"SELECT {col} c, MAX({name_col}) nm, COUNT(*) n FROM flights WHERE {base} "
+                f"AND {col} IS NOT NULL GROUP BY c ORDER BY n DESC LIMIT 8", args)]
+
+        hours = [0] * 24
+        for f in await db.q(f"SELECT first_seen_utc FROM flights WHERE {base}", args):
+            dt = parse_dt(f[0])
+            if dt:
+                hours[dt.astimezone(self.cfg.tz).hour] += 1
+        mix = [{"code": k["k"], "label": pick(request["lang"], TRAFFIC.get(k["k"], TRAFFIC["UNKNOWN"])),
+                "n": k["n"]} for k in await db.q(
+            f"SELECT traffic_type k, COUNT(*) n FROM flights WHERE {base} GROUP BY k ORDER BY n DESC", args)]
+        avg = await db.one(
+            "SELECT AVG(o.altitude_ft) alt, AVG(o.ground_speed_kt) gs, COUNT(o.altitude_ft) n "
+            "FROM track_observations o JOIN flights f ON f.id=o.flight_id "
+            "WHERE f.last_seen_utc>=? AND f.crossing_status='CONFIRMED' AND o.in_iraq=1", args)
+        coverage = await db.scalar(f"SELECT MIN(first_seen_utc) FROM flights WHERE {IRAQ_ZONE}")
+        return self.ok({
+            "days": days, "confirmed": total, "single": single,
+            "airlines": agg["a"], "types": agg["t"],
+            "complete": {"airline": agg["ha"], "type": agg["ht"], "route": agg["hd"]},
+            "top_airlines": await top("airline_icao", "airline_name"),
+            "top_types": await top("aircraft_type", "aircraft_type_desc"),
+            "top_dep": await top("dep_icao", "dep_city"), "top_arr": await top("arr_icao", "arr_city"),
+            "hours": hours, "mix": mix, "avg_alt": avg["alt"], "avg_gs": avg["gs"], "avg_n": avg["n"],
+            "coverage": coverage,
+        })
+
+    async def system(self, request: web.Request) -> web.Response:
+        db = Ctx.db
+        rows = await db.q("SELECT * FROM sync_history ORDER BY id DESC LIMIT 14")
+        last = rows[0] if rows else None
+        up = now_utc() - Ctx.started
+        out = {
+            "version": APP_VERSION, "uptime_s": int(up.total_seconds()), "interval": self.cfg.sync_interval,
+            "next": iso(Ctx.sync.next_run) if Ctx.sync.next_run else None,
+            "feed": await db.get_status("live_access"),
+            "sources": [x.strip() for x in (await db.get_status("provider") or "").split(",") if x.strip()],
+            "feeds": [p.strip() for p in (last["detail"] or "").split(";") if p.strip()] if last else [],
+            "log": [{"t": x["started_utc"], "status": x["status"], "recv": x["received"],
+                     "iraq": x["in_iraq"], "around": max(0, x["inserted"] + x["updated"] - x["in_iraq"])}
+                    for x in rows],
+            "flights": await db.scalar(f"SELECT COUNT(*) FROM flights WHERE {IRAQ_ZONE}") or 0,
+            "points": await db.scalar("SELECT COUNT(*) FROM track_observations") or 0,
+        }
+        if request["uid"] in self.cfg.admin_ids:
+            out["admin"] = {
+                "users": await db.scalar("SELECT COUNT(*) FROM users") or 0,
+                "sub_check": "FAILING" if Ctx.sub_error else "OK",
+                "lookups": Ctx.enrich.lookups, "lookup_error": Ctx.enrich.last_error,
+            }
+        return self.ok(out)
+
+    async def search(self, request: web.Request) -> web.Response:
+        query = (request.query.get("q") or "").strip()[:40]
+        if len(query) < 2:
+            return self.ok({"q": query, "results": []})
+        pattern = f"%{like_escape(query.upper())}%"
+        where = " OR ".join(f"UPPER({c}) LIKE ? ESCAPE '\\'" for c in SEARCH_COLS)
+        rows = await Ctx.db.q(
+            f"SELECT * FROM flights WHERE ({where}) ORDER BY last_seen_utc DESC LIMIT 60",
+            tuple([pattern] * len(SEARCH_COLS)))
+        return self.ok({"q": query, "results": [target_brief(r) for r in rows]})
+
+    async def watch(self, request: web.Request) -> web.Response:
+        try:
+            body = await request.json()
+            flight_id = int(body.get("id"))
+        except Exception:
+            return self.error(400, "bad_request")
+        r = await Ctx.db.one("SELECT callsign, registration, mode_s FROM flights WHERE id=?", (flight_id,))
+        target = (r["callsign"] or r["registration"] or r["mode_s"]) if r else None
+        if not target:
+            return self.error(404, "not_found")
+        uid = request["uid"]
+        if await Ctx.db.scalar("SELECT 1 FROM watch WHERE user_id=? AND ident=?", (uid, target)):
+            await Ctx.db.run("DELETE FROM watch WHERE user_id=? AND ident=?", (uid, target))
+            return self.ok({"watching": False, "ident": target})
+        count = await Ctx.db.scalar("SELECT COUNT(*) FROM watch WHERE user_id=?", (uid,)) or 0
+        if count >= WATCH_LIMIT:
+            return self.error(409, "watch_full")
+        await Ctx.db.run("INSERT OR IGNORE INTO watch(user_id, ident, created_utc) VALUES(?,?,?)",
+                         (uid, target, iso(now_utc())))
+        return self.ok({"watching": True, "ident": target})
+
+
+# --------------------------------------------------------------------------
 # PROCESS LIFECYCLE
 # --------------------------------------------------------------------------
 async def acquire_instance_lock(path: str, wait_seconds: int = 90):
@@ -3978,6 +4407,7 @@ async def amain() -> int:
     # The gate runs first for every update: language question and channel subscription.
     app.add_handler(TypeHandler(Update, gate), group=-1)
     sync.after_sync = lambda: send_notifications(app.bot)
+    webapi = WebApi(cfg, app.bot)
     for name, handler in COMMANDS.items():
         app.add_handler(CommandHandler(name, handler))
     app.add_handler(CallbackQueryHandler(on_callback))
@@ -4004,6 +4434,20 @@ async def amain() -> int:
             log.warning("could not register bot commands: %s", type(exc).__name__)
         await app.updater.start_polling(
             allowed_updates=[Update.MESSAGE, Update.CALLBACK_QUERY], error_callback=polling_error)
+        if cfg.webapp_enabled:
+            try:
+                await webapi.start()
+            except OSError as exc:
+                log.error("mini app could not listen on port %s: %s", cfg.port, exc)
+            if cfg.webapp_url:
+                try:
+                    await app.bot.set_chat_menu_button(menu_button=MenuButtonWebApp(
+                        "CONSOLE", WebAppInfo(cfg.webapp_url)))
+                except TelegramError as exc:
+                    log.warning("could not set the console menu button: %s", type(exc).__name__)
+            else:
+                log.warning("mini app has no public URL: generate a Railway domain or set WEBAPP_URL; "
+                            "the console button is hidden until then")
         ev("bot online", admins=len(cfg.admin_ids), db=cfg.db_path, tz=cfg.tz_name,
            interval=cfg.sync_interval, force_sub=cfg.force_sub, channel=cfg.channel)
         tasks = [asyncio.create_task(sync.run_forever(), name="sync"),
@@ -4023,7 +4467,7 @@ async def amain() -> int:
                 task.cancel()
         for step in (lambda: app.updater.stop() if app.updater and app.updater.running else None,
                      lambda: app.stop() if app.running else None,
-                     app.shutdown, api.close, enricher.close):
+                     webapi.stop, app.shutdown, api.close, enricher.close):
             try:
                 result = step()
                 if asyncio.iscoroutine(result):
@@ -4044,6 +4488,969 @@ async def amain() -> int:
         ev("shutdown complete", exit_code=exit_code)
     return exit_code
 
+
+
+# --------------------------------------------------------------------------
+# MINI APP PAGE (served at /).  Plain HTML, CSS and JavaScript, no build step.
+# --------------------------------------------------------------------------
+WEBAPP_HTML = r"""<!doctype html>
+<html lang="en" dir="ltr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<title>GodEyes Console</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans+Arabic:wght@400;500;600&family=Saira+Semi+Condensed:wght@400;500;600;700&display=swap">
+<style>
+:root{
+  --scope:#0B131A; --panel:#0F1A22; --raised:#14222C; --line:#1F2E39; --line-2:#2C3F4C;
+  --ink:#D9E4E9; --ink-2:#97A9B4; --ink-3:#6A7E8B;
+  --gold:#C9A24A; --gold-2:#E2C67C; --gold-ink:#16120A;
+  --red:#E5484D; --red-bg:#2A1013;
+  --target:#D3E6EC; --perimeter:#6E8796;
+  --ui:"Saira Semi Condensed", system-ui, sans-serif;
+  --data:"IBM Plex Mono", ui-monospace, monospace;
+  --top:max(env(safe-area-inset-top),var(--tg-content-safe-area-inset-top,0px));
+  --bottom:max(env(safe-area-inset-bottom),var(--tg-content-safe-area-inset-bottom,0px));
+}
+html[lang="ar"]{--ui:"IBM Plex Sans Arabic", system-ui, sans-serif}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;background:var(--scope);color:var(--ink);font-family:var(--ui);font-size:15px;line-height:1.4;-webkit-font-smoothing:antialiased;-webkit-tap-highlight-color:transparent}
+body{overflow:hidden;overscroll-behavior:none}
+button{font:inherit;color:inherit;background:none;border:0;padding:0;cursor:pointer}
+button:focus-visible,a:focus-visible,input:focus-visible{outline:2px solid var(--gold);outline-offset:2px}
+.num,.data{font-family:var(--data);font-variant-numeric:tabular-nums;letter-spacing:0}
+[hidden]{display:none!important}
+
+/* ---------- frame ---------- */
+#app{position:fixed;inset:0;display:grid;grid-template-rows:auto 1fr auto auto}
+.bar{display:flex;align-items:center;gap:12px;padding:calc(var(--top) + 8px) 14px 8px;border-bottom:1px solid var(--line);background:var(--scope)}
+.mark{display:flex;align-items:baseline;gap:8px;min-width:0}
+.mark b{font-family:"Saira Semi Condensed",sans-serif;font-weight:700;font-size:17px;letter-spacing:.14em;color:var(--gold-2)}
+.mark span{font-family:"Saira Semi Condensed",sans-serif;font-size:12.5px;letter-spacing:.06em;color:var(--ink-3);white-space:nowrap}
+.bar .spacer{flex:1}
+.clock{font-family:var(--data);font-size:13px;color:var(--ink-2)}
+.feed{display:flex;align-items:center;gap:6px;font-family:var(--data);font-size:12.5px;color:var(--ink-2);white-space:nowrap}
+@media (max-width:420px){.mark span{display:none}}
+.feed i{width:7px;height:7px;background:var(--gold);display:block}
+.feed.stale i{background:var(--red)}
+.feed.wait i{background:var(--ink-3)}
+main{position:relative;overflow:hidden;min-height:0}
+.view{position:absolute;inset:0;overflow-y:auto;-webkit-overflow-scrolling:touch}
+.view.pad{padding:14px 14px 20px}
+.credit{display:flex;justify-content:center;gap:6px;padding:5px 12px;border-top:1px solid var(--line);font-size:11.5px;color:var(--ink-3);background:var(--scope);direction:ltr;letter-spacing:.02em}
+.credit b{color:var(--gold);font-weight:600}
+nav{display:grid;grid-template-columns:repeat(4,1fr);border-top:1px solid var(--line);background:var(--panel);padding-bottom:var(--bottom)}
+nav button{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:3px;min-height:54px;color:var(--ink-3);font-size:12.5px;font-weight:500;position:relative}
+nav button svg{width:21px;height:21px;stroke:currentColor;fill:none;stroke-width:1.6}
+nav button[aria-selected="true"]{color:var(--gold-2)}
+nav button[aria-selected="true"]::before{content:"";position:absolute;top:-1px;left:28%;right:28%;height:2px;background:var(--gold)}
+
+/* ---------- scope ---------- */
+#scope{touch-action:none;overflow:hidden}
+#scope canvas{position:absolute;inset:0;width:100%;height:100%;display:block;cursor:crosshair}
+.tools{position:absolute;top:10px;inset-inline-end:10px;display:flex;flex-direction:column;border:1px solid var(--line-2);background:rgba(11,19,26,.88)}
+.tools button{width:44px;height:44px;display:grid;place-items:center;color:var(--ink-2);border-bottom:1px solid var(--line)}
+.tools button:last-child{border-bottom:0}
+.tools svg{width:18px;height:18px;stroke:currentColor;fill:none;stroke-width:1.6}
+.tools button[aria-pressed="true"]{color:var(--gold-2)}
+.layers{position:absolute;top:10px;inset-inline-start:10px;display:flex;border:1px solid var(--line-2);background:rgba(11,19,26,.88)}
+.layers button{height:34px;padding:0 11px;font-size:13px;color:var(--ink-3);border-inline-end:1px solid var(--line)}
+.layers button:last-child{border-inline-end:0}
+.layers button[aria-pressed="true"]{color:var(--ink);background:var(--raised)}
+.readout{position:absolute;bottom:28px;inset-inline-start:10px;font-family:var(--data);font-size:11.5px;color:var(--ink-3);line-height:1.5;pointer-events:none;direction:ltr;text-align:left}
+.scalebar{height:6px;border:1px solid var(--ink-3);border-top:0;margin-bottom:3px}
+.pick{position:absolute;left:10px;right:10px;bottom:10px;border:1px solid var(--line-2);background:rgba(15,26,34,.96);display:grid;grid-template-columns:1fr auto;align-items:stretch}
+.pick .info{padding:10px 12px;min-width:0}
+.pick .cs{font-weight:600;font-size:18px;letter-spacing:.04em;font-family:"Saira Semi Condensed",sans-serif}
+.pick .sub{font-size:13px;color:var(--ink-2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.pick .vals{display:flex;gap:14px;margin-top:4px;font-family:var(--data);font-size:13px;color:var(--ink)}
+.pick .vals em{font-style:normal;color:var(--ink-3)}
+.pick .open{border-inline-start:1px solid var(--line-2);padding:0 16px;color:var(--gold-2);font-weight:600;font-size:14px}
+
+/* ---------- strips ---------- */
+.search{display:flex;border:1px solid var(--line-2);background:var(--panel);margin-bottom:10px}
+.search input{flex:1;min-width:0;height:44px;background:none;border:0;color:var(--ink);font:inherit;padding:0 12px;font-family:var(--data);font-size:14px}
+.search input::placeholder{color:var(--ink-3);font-family:var(--ui)}
+.search button{width:44px;color:var(--ink-3)}
+.seg{display:flex;border:1px solid var(--line-2);margin-bottom:12px}
+.seg button{flex:1;height:38px;font-size:13.5px;color:var(--ink-3);border-inline-end:1px solid var(--line)}
+.seg button:last-child{border-inline-end:0}
+.seg button[aria-pressed="true"]{color:var(--gold-ink);background:var(--gold);font-weight:600}
+.count{font-size:13px;color:var(--ink-3);margin:0 0 8px}
+.strip{display:grid;grid-template-columns:46px 1fr auto;width:100%;text-align:start;border:1px solid var(--line);background:var(--panel);margin-bottom:6px;min-height:58px}
+.strip:active{background:var(--raised)}
+.strip .code{display:grid;place-items:center;border-inline-end:1px solid var(--line);font-family:var(--data);font-size:11px;font-weight:600;color:var(--ink-2);letter-spacing:.04em}
+.strip.CNF .code{color:var(--gold)}
+.strip.PRM .code{color:var(--perimeter)}
+.strip.emg{border-color:var(--red)}
+.strip.emg .code{color:#fff;background:var(--red)}
+.strip .mid{padding:8px 11px;min-width:0;display:grid;gap:2px}
+.strip .l1{display:flex;gap:10px;align-items:baseline;min-width:0}
+.strip .cs{font-family:"Saira Semi Condensed",sans-serif;font-weight:600;font-size:16.5px;letter-spacing:.04em}
+.strip .ty{font-family:var(--data);font-size:12.5px;color:var(--ink-2)}
+.strip .l2{font-size:13px;color:var(--ink-2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.strip .rt{font-family:var(--data);color:var(--ink)}
+.strip .end{direction:ltr;padding:8px 11px;border-inline-start:1px solid var(--line);display:grid;align-content:center;justify-items:end;gap:2px;font-family:var(--data);font-size:13px;min-width:84px}
+.strip .end span{color:var(--ink-3);font-size:11.5px}
+.empty{border:1px dashed var(--line-2);padding:22px 16px;color:var(--ink-2);font-size:14px}
+
+/* ---------- shared blocks ---------- */
+h2{font-family:"Saira Semi Condensed",sans-serif;font-size:13.5px;font-weight:600;letter-spacing:.05em;color:var(--ink-2);margin:22px 0 8px;display:flex;align-items:center;gap:10px}
+html[lang="ar"] h2{font-family:var(--ui);letter-spacing:0}
+h2::after{content:"";flex:1;height:1px;background:var(--line)}
+.kv{display:grid;grid-template-columns:1fr 1fr;border-top:1px solid var(--line)}
+.kv div{padding:9px 0;border-bottom:1px solid var(--line);min-width:0}
+.kv div:nth-child(odd){padding-inline-end:12px}
+.kv div:nth-child(even){padding-inline-start:12px;border-inline-start:1px solid var(--line)}
+.kv dt{font-size:12.5px;color:var(--ink-3)}
+.kv dd{margin:2px 0 0;font-family:"IBM Plex Mono","IBM Plex Sans Arabic",monospace;font-size:14px;overflow-wrap:anywhere;unicode-bidi:plaintext}
+html[dir="rtl"] .kv dd{text-align:right}
+.kv dd small{color:var(--ink-3);font-size:12px}
+.note{font-size:12.5px;color:var(--ink-3);margin:8px 0 0}
+.btn{min-height:44px;padding:0 16px;border:1px solid var(--line-2);color:var(--ink);font-size:14px;font-weight:500;display:inline-flex;align-items:center;justify-content:center;gap:8px}
+.btn.primary{background:var(--gold);color:var(--gold-ink);border-color:var(--gold);font-weight:600}
+.btn.on{border-color:var(--gold);color:var(--gold-2)}
+.row-btns{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:14px}
+
+/* ---------- dossier ---------- */
+#dossier{position:fixed;inset:0;z-index:20;background:var(--scope);display:grid;grid-template-rows:auto 1fr auto;transform:translateY(100%);transition:transform .22s ease-out}
+#dossier.open{transform:none}
+.dhead{padding:calc(var(--top) + 10px) 14px 12px;border-bottom:1px solid var(--line);display:grid;grid-template-columns:1fr auto;gap:4px 12px;align-items:start}
+.dhead .cs{font-family:"Saira Semi Condensed",sans-serif;font-weight:700;font-size:30px;letter-spacing:.05em;line-height:1.05}
+.dhead .op{color:var(--ink-2);font-size:14px}
+.dhead .close{width:44px;height:44px;border:1px solid var(--line-2);display:grid;place-items:center;color:var(--ink-2)}
+.status{grid-column:1/-1;display:flex;gap:10px;align-items:center;font-size:13.5px;color:var(--ink-2);margin-top:6px}
+.chip{font-family:var(--data);font-size:11.5px;font-weight:600;padding:2px 6px;border:1px solid currentColor;letter-spacing:.06em}
+.chip.CNF{color:var(--gold)} .chip.PRM,.chip.GLB{color:var(--perimeter)} .chip.OB{color:var(--ink-2)}
+.alert{grid-column:1/-1;margin-top:8px;padding:8px 10px;background:var(--red-bg);border:1px solid var(--red);color:#FFD9DB;font-size:14px;font-weight:500}
+.dbody{overflow-y:auto;padding:4px 14px 24px;-webkit-overflow-scrolling:touch}
+.route{display:grid;grid-template-columns:auto 1fr auto;gap:12px;align-items:center;margin-top:10px}
+.route .ap{min-width:0}
+.route .ap b{display:block;font-family:"Saira Semi Condensed",sans-serif;font-size:28px;font-weight:600;letter-spacing:.04em;line-height:1}
+.route .ap span{display:block;font-size:12.5px;color:var(--ink-2);max-width:110px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.route .ap:last-child{text-align:end}
+.track-bar{position:relative;height:18px;direction:ltr}
+.track-bar::before{content:"";position:absolute;left:0;right:0;top:8px;height:1px;background:repeating-linear-gradient(90deg,var(--ink-3) 0 3px,transparent 3px 7px)}
+.track-bar .done{position:absolute;left:0;top:8px;height:2px;margin-top:-.5px;background:var(--gold)}
+.track-bar svg{position:absolute;top:1px;width:16px;height:16px;margin-left:-8px;fill:var(--gold-2)}
+html[dir="rtl"] .route{direction:ltr}
+html[dir="rtl"] .route .ap span{direction:rtl}
+.figure{border:1px solid var(--line);background:var(--panel);margin-top:4px;position:relative}
+.figure svg{display:block;width:100%}
+.tip{position:absolute;pointer-events:none;background:var(--raised);border:1px solid var(--line-2);padding:4px 7px;font-family:var(--data);font-size:12px;white-space:nowrap;transform:translate(-50%,-100%);margin-top:-8px;color:var(--ink)}
+.recent button{display:grid;grid-template-columns:auto 1fr auto;gap:10px;width:100%;text-align:start;padding:10px 0;border-bottom:1px solid var(--line);font-size:14px;align-items:center}
+.recent .rt{font-family:var(--data);color:var(--ink-2);font-size:13px}
+.recent time{font-family:var(--data);color:var(--ink-3);font-size:12.5px}
+.foot-meta{font-family:var(--data);font-size:11.5px;color:var(--ink-3);margin-top:20px;direction:ltr}
+
+/* ---------- traffic ---------- */
+.tiles{display:grid;grid-template-columns:1fr 1fr;border:1px solid var(--line)}
+.tiles div{padding:12px;border-bottom:1px solid var(--line)}
+.tiles div:nth-child(odd){border-inline-end:1px solid var(--line)}
+.tiles div:nth-last-child(-n+2){border-bottom:0}
+.tiles b{display:block;font-family:var(--data);font-size:24px;font-weight:500;color:var(--ink)}
+.tiles span{font-size:12.5px;color:var(--ink-3)}
+.tiles .lead b{color:var(--gold-2)}
+.rank{width:100%;border-collapse:collapse;font-size:13.5px}
+.rank td{padding:7px 0;border-bottom:1px solid var(--line);vertical-align:middle}
+.rank td.c{font-family:var(--data);width:58px;color:var(--ink)}
+.rank td.n{font-family:var(--data);text-align:end;width:44px}
+.rank td.nm{color:var(--ink-2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:0;padding-inline-end:10px}
+.rank td.b{width:34%}
+.rank .bar-in{height:6px;background:var(--gold);border-radius:0 3px 3px 0}
+html[dir="rtl"] .rank .bar-in{border-radius:3px 0 0 3px}
+
+/* ---------- system ---------- */
+.log{width:100%;border-collapse:collapse;font-family:var(--data);font-size:12.5px;direction:ltr}
+.log th{font-family:var(--ui);font-weight:500;font-size:12px;color:var(--ink-3);text-align:left;padding:6px 0;border-bottom:1px solid var(--line-2)}
+.log td{padding:6px 0;border-bottom:1px solid var(--line)}
+.log td.r,.log th.r{text-align:right}
+.ok{color:var(--gold-2)} .bad{color:var(--red)}
+.links{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:12px}
+
+/* ---------- gate ---------- */
+.gate{position:fixed;inset:0;z-index:40;background:var(--scope);display:grid;place-items:center;padding:24px}
+.gate .box{max-width:340px;width:100%}
+.gate .eye{width:64px;height:64px;margin-bottom:18px}
+.gate h1{font-family:"Saira Semi Condensed",sans-serif;font-size:22px;font-weight:600;margin:0 0 8px}
+html[lang="ar"] .gate h1{font-family:var(--ui)}
+.gate p{color:var(--ink-2);margin:0 0 18px}
+.gate .btn{width:100%;margin-bottom:8px}
+.gate .credit{position:fixed;left:0;right:0;bottom:0;padding-bottom:calc(var(--bottom) + 6px)}
+.boot{font-family:var(--data);font-size:12.5px;color:var(--ink-3);line-height:1.7}
+.boot b{color:var(--gold-2);font-weight:500}
+@media (prefers-reduced-motion:reduce){#dossier{transition:none}}
+@media (min-width:760px){
+  .view.pad{max-width:760px;margin:0 auto}
+  #dossier .dbody,#dossier .dhead{max-width:760px;width:100%;margin:0 auto}
+}
+</style>
+</head>
+<body>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <symbol id="i-scope" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="5"/><path d="M12 12 18.4 5.6M12 3v2M12 19v2M3 12h2M19 12h2"/></symbol>
+  <symbol id="i-strips" viewBox="0 0 24 24"><path d="M3 5h18v4H3zM3 11h18v4H3zM3 17h18v4H3zM8 5v4M8 11v4M8 17v4"/></symbol>
+  <symbol id="i-traffic" viewBox="0 0 24 24"><path d="M4 20V10M9.3 20V4M14.6 20v-7M20 20V8M3 20h18"/></symbol>
+  <symbol id="i-system" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="12"/><path d="M8 20h8M12 16v4M7 9l2 2-2 2M11 13h5"/></symbol>
+  <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+  <symbol id="i-minus" viewBox="0 0 24 24"><path d="M5 12h14"/></symbol>
+  <symbol id="i-center" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 2v5M12 17v5M2 12h5M17 12h5"/></symbol>
+  <symbol id="i-label" viewBox="0 0 24 24"><path d="M4 6h10M4 11h16M4 16h7"/><path d="M15 17l3 3 3-6"/></symbol>
+  <symbol id="i-close" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></symbol>
+  <symbol id="i-find" viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m15.5 15.5 5 5"/></symbol>
+  <symbol id="i-plane" viewBox="-32 -32 64 64"><path d="M0-30C3-30 5-24 5-18L5-6L30 10L30 15L5 8L4 20L12 27L12 30L0 27L-12 30L-12 27L-4 20L-5 8L-30 15L-30 10L-5-6L-5-18C-5-24-3-30 0-30Z"/></symbol>
+</svg>
+
+<div id="gate" class="gate">
+  <div class="box">
+    <svg class="eye" viewBox="0 0 64 64" aria-hidden="true"><path d="M4 32C16 16 48 16 60 32C48 46 16 46 4 32Z" fill="none" stroke="#C9A24A" stroke-width="2.5"/><circle cx="32" cy="32" r="11" fill="#E5484D"/><circle cx="32" cy="32" r="4.5" fill="#0B131A"/></svg>
+    <div id="gate-body" class="boot"></div>
+  </div>
+  <div class="credit">Dev &amp; Powered by <b>KroTheCommander</b></div>
+</div>
+
+<div id="app" hidden>
+  <header class="bar">
+    <div class="mark"><b>GODEYES</b><span id="t-sub">IQ airspace</span></div>
+    <div class="spacer"></div>
+    <div class="feed wait" id="feed"><i></i><span id="feed-txt">--</span></div>
+    <div class="clock" id="clock">--:--:--</div>
+  </header>
+  <main>
+    <section class="view" id="scope" role="tabpanel">
+      <canvas id="cv" aria-label="Radar scope of Iraqi airspace"></canvas>
+      <div class="layers" role="group">
+        <button id="ly-iraq" aria-pressed="true"></button>
+        <button id="ly-prm" aria-pressed="true"></button>
+      </div>
+      <div class="tools">
+        <button id="zin" aria-label="Zoom in"><svg><use href="#i-plus"/></svg></button>
+        <button id="zout" aria-label="Zoom out"><svg><use href="#i-minus"/></svg></button>
+        <button id="zfit" aria-label="Fit Iraq"><svg><use href="#i-center"/></svg></button>
+        <button id="zlbl" aria-pressed="true" aria-label="Data blocks"><svg><use href="#i-label"/></svg></button>
+      </div>
+      <div class="readout"><div class="scalebar" id="scalebar"></div><div id="scaletxt"></div><div id="rings"></div><div id="coords"></div></div>
+      <div class="pick" id="pick" hidden></div>
+    </section>
+    <section class="view pad" id="strips" role="tabpanel" hidden>
+      <form class="search" id="search-form" role="search">
+        <input id="q" autocomplete="off" autocapitalize="characters" spellcheck="false" maxlength="40">
+        <button type="submit" id="q-go"><svg width="18" height="18" stroke="currentColor" fill="none" stroke-width="1.6"><use href="#i-find"/></svg></button>
+      </form>
+      <div class="seg" role="group" id="strip-seg"></div>
+      <p class="count" id="strip-count"></p>
+      <div id="strip-list"></div>
+    </section>
+    <section class="view pad" id="traffic" role="tabpanel" hidden></section>
+    <section class="view pad" id="system" role="tabpanel" hidden></section>
+  </main>
+  <div class="credit">Dev &amp; Powered by <b>KroTheCommander</b></div>
+  <nav role="tablist">
+    <button role="tab" data-v="scope" aria-selected="true"><svg><use href="#i-scope"/></svg><span></span></button>
+    <button role="tab" data-v="strips" aria-selected="false"><svg><use href="#i-strips"/></svg><span></span></button>
+    <button role="tab" data-v="traffic" aria-selected="false"><svg><use href="#i-traffic"/></svg><span></span></button>
+    <button role="tab" data-v="system" aria-selected="false"><svg><use href="#i-system"/></svg><span></span></button>
+  </nav>
+</div>
+
+<section id="dossier" aria-modal="true" role="dialog" hidden>
+  <div class="dhead" id="d-head"></div>
+  <div class="dbody" id="d-body"></div>
+  <div class="credit">Dev &amp; Powered by <b>KroTheCommander</b></div>
+</section>
+
+<script>
+"use strict";
+const tg = window.Telegram && window.Telegram.WebApp;
+const $ = (s, r = document) => r.querySelector(s);
+const esc = v => String(v ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c]));
+const ver = v => !!(tg && tg.isVersionAtLeast && tg.isVersionAtLeast(v));
+
+/* ---------------------------------------------------------------- language */
+const L = {
+  en: {
+    sub: "IQ airspace", nav: ["Scope", "Strips", "Traffic", "System"],
+    iraq: "Iraq", prm: "Perimeter", emg: "Emergency", all: "All",
+    open: "Open file", search: "Callsign, registration, airline, airport", searching: "Searching the archive",
+    shown: n => `${n} aircraft`, results: n => `${n} archived records`,
+    noLive: "No aircraft in this zone at the last update. The scope refreshes on its own.",
+    noRes: "Nothing in the archive matches that query.",
+    age: s => s < 90 ? `${s}s` : s < 5400 ? `${Math.round(s / 60)}m` : `${Math.round(s / 3600)}h`,
+    coast: "coasting", synced: "synced", stale: "stale", pending: "waiting for first sync",
+    flight: "Flight", aircraft: "Aircraft", telemetry: "Telemetry", iraqAir: "Iraqi airspace",
+    altProfile: "Altitude profile", trackMap: "Track", recent: "Other records of this aircraft",
+    callsign: "Callsign", number: "Flight number", operator: "Operator", reg: "Registration", hex: "ICAO24",
+    type: "Type", model: "Model", maker: "Manufacturer", owner: "Owner", country: "Country", cat: "Weight class",
+    alt: "Altitude", galt: "GPS altitude", gs: "Ground speed", hdg: "Heading", vr: "Vertical rate", sq: "Squawk",
+    mach: "Mach", ias: "IAS / TAS", selalt: "Selected altitude", selhdg: "Selected heading", wind: "Wind",
+    oat: "Outside air", pos: "Position", near: "Nearest city", src: "Signal", seen: "Last seen",
+    first: "First observed", last: "Last observed", dur: "Time over Iraq", obs: "Observations",
+    level: "level", flown: "Flown", remaining: "Remaining", eta: "Estimated arrival",
+    routeSrc: s => `Route from the ${s} database, matched by callsign. It is the usual route for this callsign, not a filed flight plan.`,
+    routeNone: "No route database knows this callsign.",
+    routePending: "Route not looked up yet.",
+    times: "Scheduled and actual times are not available from open sources.",
+    watch: "Watch", watching: "Watching", map: "Open in Maps", photo: "Aircraft photo",
+    watchFull: "Your watchlist is full. Remove one in the bot first.",
+    durVal: m => `at least ${m} min`, durNa: "needs two observations",
+    traffic: "Traffic", period: ["24 h", "7 days", "30 days", "All"],
+    confirmed: "Confirmed crossings", single: "Single sightings, not counted", ops: "Operators", types: "Aircraft types",
+    hourly: tz => `Entries by hour, ${tz}`, topOps: "Operators", topTypes: "Aircraft types",
+    topDep: "Origins", topArr: "Destinations", mix: "Traffic mix", avgAlt: "Average altitude", avgGs: "Average speed",
+    complete: "Fields known", fAirline: "operator", fType: "type", fRoute: "route",
+    coverage: d => `The archive starts on ${d}. Counts cover only what the bot has observed; short crossings between samples can be missed.`,
+    noStats: "No confirmed crossings in this period yet.",
+    sys: "System", feed: "Live feed", sources: "Sources answering", uptime: "Uptime", interval: "Sync interval",
+    next: "Next sync", stored: "Iraq records", points: "Track points", feeds: "Last sync by source",
+    log: "Sync log", time: "Time", status: "Result", recv: "Received", inIraq: "Iraq", around: "Around",
+    admin: "Administration", users: "Users", subCheck: "Subscription check", lookups: "Route lookups",
+    channel: "Channel", dev: "Developer", version: "Version",
+    gateBoot: ["Verifying session", "Linking to the archive", "Loading the scope"],
+    noTg: ["Open this console from the bot", "The console only works inside Telegram. Open the bot and press Open console."],
+    expired: ["Session expired", "Close the console and open it again from the bot."],
+    locked: ["Channel subscription required", c => `Join @${c} to use the console, then check again.`],
+    join: "Join channel", recheck: "Check again", retry: "Retry",
+    failed: ["Console unavailable", "The server did not answer. Check your connection and retry."],
+    tapHint: "Tap a target to read it. Drag to pan, pinch to zoom.", rings: "Rings 50 NM from Baghdad", tracked: "tracked",
+  },
+  ar: {
+    sub: "الأجواء العراقية", nav: ["الرادار", "الشرائط", "الحركة", "النظام"],
+    iraq: "العراق", prm: "المحيط", emg: "طوارئ", all: "الكل",
+    open: "فتح الملف", search: "رمز النداء، التسجيل، الشركة، المطار", searching: "جارٍ البحث في الأرشيف",
+    shown: n => `${n} طائرة`, results: n => `${n} سجل في الأرشيف`,
+    noLive: "لا توجد طائرات في هذه المنطقة في آخر تحديث. الرادار يتحدّث تلقائياً.",
+    noRes: "لا يوجد في الأرشيف ما يطابق هذا البحث.",
+    age: s => s < 90 ? `${s}ث` : s < 5400 ? `${Math.round(s / 60)}د` : `${Math.round(s / 3600)}س`,
+    coast: "تقدير", synced: "تحديث", stale: "قديم", pending: "بانتظار أول مزامنة",
+    flight: "الرحلة", aircraft: "الطائرة", telemetry: "القياسات", iraqAir: "الأجواء العراقية",
+    altProfile: "منحنى الارتفاع", trackMap: "المسار", recent: "سجلات أخرى لهذه الطائرة",
+    callsign: "رمز النداء", number: "رقم الرحلة", operator: "المشغّل", reg: "التسجيل", hex: "ICAO24",
+    type: "النوع", model: "الموديل", maker: "المصنّع", owner: "المالك", country: "الدولة", cat: "فئة الوزن",
+    alt: "الارتفاع", galt: "ارتفاع GPS", gs: "السرعة الأرضية", hdg: "الاتجاه", vr: "معدّل الصعود/الهبوط", sq: "Squawk",
+    mach: "ماخ", ias: "IAS / TAS", selalt: "الارتفاع المختار", selhdg: "الاتجاه المختار", wind: "الرياح",
+    oat: "الحرارة الخارجية", pos: "الموقع", near: "أقرب مدينة", src: "الإشارة", seen: "آخر رصد",
+    first: "أول رصد", last: "آخر رصد", dur: "المدة فوق العراق", obs: "عدد مرات الرصد",
+    level: "مستوٍ", flown: "المقطوع", remaining: "المتبقّي", eta: "الوصول التقديري",
+    routeSrc: s => `المسار من قاعدة بيانات ${s} حسب رمز النداء. هو المسار المعتاد لهذا الرمز وليس خطة رحلة مقدَّمة.`,
+    routeNone: "لا تعرف قواعد بيانات المسارات هذا الرمز.",
+    routePending: "لم يُبحث عن المسار بعد.",
+    times: "أوقات الجدول والإقلاع والوصول الفعلية غير متوفرة من المصادر المفتوحة.",
+    watch: "متابعة", watching: "تتم المتابعة", map: "فتح في الخرائط", photo: "صورة الطائرة",
+    watchFull: "قائمة المتابعة ممتلئة. احذف عنصراً من البوت أولاً.",
+    durVal: m => `${m} دقيقة على الأقل`, durNa: "تحتاج رصدين",
+    traffic: "الحركة", period: ["24 ساعة", "7 أيام", "30 يوماً", "الكل"],
+    confirmed: "عبور مؤكَّد", single: "رصد واحد، لا يُحتسب", ops: "المشغّلون", types: "أنواع الطائرات",
+    hourly: tz => `الدخول حسب الساعة، ${tz}`, topOps: "المشغّلون", topTypes: "أنواع الطائرات",
+    topDep: "مطارات الإقلاع", topArr: "مطارات الوصول", mix: "أنواع الحركة", avgAlt: "متوسط الارتفاع", avgGs: "متوسط السرعة",
+    complete: "الحقول المعروفة", fAirline: "المشغّل", fType: "النوع", fRoute: "المسار",
+    coverage: d => `يبدأ الأرشيف في ${d}. الأرقام تشمل ما رصده البوت فقط؛ وقد تفوت العبورات القصيرة بين العيّنات.`,
+    noStats: "لا يوجد عبور مؤكَّد في هذه الفترة بعد.",
+    sys: "النظام", feed: "البث المباشر", sources: "المصادر المستجيبة", uptime: "مدة التشغيل", interval: "فاصل المزامنة",
+    next: "المزامنة القادمة", stored: "سجلات العراق", points: "نقاط المسار", feeds: "آخر مزامنة لكل مصدر",
+    log: "سجل المزامنة", time: "الوقت", status: "النتيجة", recv: "المستلم", inIraq: "العراق", around: "المحيط",
+    admin: "الإدارة", users: "المستخدمون", subCheck: "التحقق من الاشتراك", lookups: "عمليات بحث المسارات",
+    channel: "القناة", dev: "المطوّر", version: "الإصدار",
+    gateBoot: ["التحقق من الجلسة", "الربط بالأرشيف", "تحميل الرادار"],
+    noTg: ["افتح هذه الواجهة من البوت", "تعمل الواجهة داخل تيليغرام فقط. افتح البوت واضغط «فتح المنظومة»."],
+    expired: ["انتهت الجلسة", "أغلق الواجهة وافتحها مجدداً من البوت."],
+    locked: ["الاشتراك في القناة مطلوب", c => `اشترك في @${c} لاستخدام الواجهة ثم أعد التحقق.`],
+    join: "الاشتراك في القناة", recheck: "إعادة التحقق", retry: "إعادة المحاولة",
+    failed: ["الواجهة غير متاحة", "لم يستجب الخادم. تحقّق من الاتصال وأعد المحاولة."],
+    tapHint: "اضغط على هدف لقراءته. اسحب للتحريك، وقرّب بإصبعين للتكبير.", rings: "حلقات كل 50 ميلاً من بغداد", tracked: "مرصودة",
+  },
+};
+let lang = (tg && tg.initDataUnsafe && tg.initDataUnsafe.user && /^ar/i.test(tg.initDataUnsafe.user.language_code || "")) ? "ar" : "en";
+const T = () => L[lang];
+function setLang(l) {
+  lang = l === "ar" ? "ar" : "en";
+  document.documentElement.lang = lang;
+  document.documentElement.dir = lang === "ar" ? "rtl" : "ltr";
+}
+
+/* ---------------------------------------------------------------- api */
+const state = { boot: null, live: null, view: "scope", filter: "iraq", selected: null, labels: true,
+  layers: { iraq: true, prm: true }, period: 1, query: "", results: null, dossierId: null };
+class ApiError extends Error { constructor(status, body) { super(body && body.error || status); this.status = status; this.body = body; } }
+async function api(path, opts = {}) {
+  const res = await fetch(path, { ...opts, headers: { "X-Init-Data": tg ? tg.initData : "", "Content-Type": "application/json", ...(opts.headers || {}) } });
+  let body = null; try { body = await res.json(); } catch (e) {}
+  if (!res.ok) throw new ApiError(res.status, body);
+  return body;
+}
+const haptic = kind => { try { if (!ver("6.1")) return;
+  if (kind === "select") tg.HapticFeedback.selectionChanged();
+  else if (kind === "ok") tg.HapticFeedback.notificationOccurred("success");
+  else if (kind === "err") tg.HapticFeedback.notificationOccurred("error");
+  else tg.HapticFeedback.impactOccurred("light"); } catch (e) {} };
+const openLink = url => { if (tg && tg.openLink) tg.openLink(url); else window.open(url, "_blank", "noopener"); };
+const openTg = url => { if (tg && tg.openTelegramLink) tg.openTelegramLink(url); else window.open(url, "_blank", "noopener"); };
+
+/* ---------------------------------------------------------------- time & format */
+const fmtTime = (iso, withDate) => {
+  if (!iso) return "--";
+  const tz = state.boot ? state.boot.tz : undefined;
+  const o = withDate ? { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false, timeZone: tz }
+                     : { hour: "2-digit", minute: "2-digit", hour12: false, timeZone: tz };
+  return new Intl.DateTimeFormat("en-GB", o).format(new Date(iso)).replace(",", "");
+};
+const ageS = iso => iso ? Math.max(0, Math.round((Date.now() - Date.parse(iso)) / 1000)) : null;
+const n0 = v => v == null ? "--" : Math.round(v).toLocaleString("en-US");
+const fl = a => a == null ? "---" : String(Math.round(a / 100)).padStart(3, "0");
+
+/* ---------------------------------------------------------------- gate */
+function gate(kind, extra) {
+  const g = $("#gate"), body = $("#gate-body");
+  g.hidden = false;
+  if (kind === "boot") {
+    body.innerHTML = T().gateBoot.map((s, i) => `<div>${i < extra ? "<b>OK</b>" : "&nbsp;.."}&nbsp; ${esc(s)}</div>`).join("");
+    return;
+  }
+  const map = { notg: T().noTg, expired: T().expired, failed: T().failed };
+  if (kind === "locked") {
+    const [h, p] = T().locked;
+    body.className = "";
+    body.innerHTML = `<h1>${esc(h)}</h1><p>${esc(p(extra))}</p>
+      <button class="btn primary" id="g-join">${esc(T().join)}</button>
+      <button class="btn" id="g-re">${esc(T().recheck)}</button>`;
+    $("#g-join").onclick = () => openTg(`https://t.me/${extra}`);
+    $("#g-re").onclick = () => start();
+    return;
+  }
+  const [h, p] = map[kind];
+  body.className = "";
+  body.innerHTML = `<h1>${esc(h)}</h1><p>${esc(p)}</p>` + (kind === "failed" ? `<button class="btn" id="g-re">${esc(T().retry)}</button>` : "");
+  if (kind === "failed") $("#g-re").onclick = () => start();
+}
+function handleErr(e) {
+  if (e instanceof ApiError) {
+    if (e.status === 401) return gate("expired");
+    if (e.status === 403) return gate("locked", e.body && e.body.channel);
+  }
+  gate("failed");
+}
+
+/* ---------------------------------------------------------------- shell */
+function applyStatic() {
+  $("#t-sub").textContent = T().sub;
+  document.querySelectorAll("nav button span").forEach((s, i) => s.textContent = T().nav[i]);
+  $("#ly-iraq").textContent = T().iraq; $("#ly-prm").textContent = T().prm;
+  $("#q").placeholder = T().search;
+  $("#strip-seg").innerHTML = [["iraq", T().iraq], ["prm", T().prm], ["emg", T().emg]]
+    .map(([k, t]) => `<button data-f="${k}" aria-pressed="${state.filter === k}">${esc(t)}</button>`).join("");
+}
+function show(v) {
+  state.view = v;
+  document.querySelectorAll("nav button").forEach(b => b.setAttribute("aria-selected", b.dataset.v === v));
+  ["scope", "strips", "traffic", "system"].forEach(id => $("#" + id).hidden = id !== v);
+  if (v === "scope") { resize(); }
+  if (v === "strips") renderStrips();
+  if (v === "traffic") loadTraffic();
+  if (v === "system") loadSystem();
+}
+function tick() {
+  const tz = state.boot ? state.boot.tz : undefined;
+  $("#clock").textContent = new Intl.DateTimeFormat("en-GB", { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false, timeZone: tz }).format(new Date());
+  const live = state.live, feed = $("#feed");
+  if (!live) return;
+  const a = ageS(live.last_ok);
+  const stale = a == null || a > 3 * live.interval;
+  feed.className = "feed " + (a == null ? "wait" : stale ? "stale" : "");
+  const shown = live.targets.filter(t => t.st !== "PRM").length;
+  $("#feed-txt").textContent = a == null ? T().pending : `${shown} ${T().tracked}   ${T().age(a)}`;
+}
+
+/* ---------------------------------------------------------------- live data */
+async function loadLive() {
+  try {
+    state.live = await api("/api/live");
+    if (state.selected && !state.live.targets.some(t => t.id === state.selected)) state.selected = null;
+    draw(); renderPick(); if (state.view === "strips" && !state.results) renderStrips(); tick();
+  } catch (e) { if (e instanceof ApiError && (e.status === 401 || e.status === 403)) handleErr(e); }
+}
+/* Dead reckoning between syncs: positions move along heading at ground speed,
+   capped at 6 minutes, and are drawn as hollow "coasting" tracks after 90 s. */
+function project(t) {
+  const a = ageS(t.seen) || 0;
+  if (!t.gs || t.hdg == null || a < 5) return { lat: t.lat, lon: t.lon, age: a, coast: false };
+  const s = Math.min(a, 360), nm = t.gs * s / 3600, r = t.hdg * Math.PI / 180;
+  const lat = t.lat + nm * Math.cos(r) / 60;
+  const lon = t.lon + nm * Math.sin(r) / (60 * Math.cos(t.lat * Math.PI / 180));
+  return { lat, lon, age: a, coast: a > 90 };
+}
+
+/* ---------------------------------------------------------------- scope */
+const cv = $("#cv"), ctx = cv.getContext("2d");
+const view = { lat: 33.2, lon: 43.8, ppd: 70 }; // pixels per degree of latitude
+let W = 0, H = 0, DPR = 1;
+const K = () => Math.cos(view.lat * Math.PI / 180);
+const toXY = (lat, lon) => [W / 2 + (lon - view.lon) * view.ppd * K(), H / 2 - (lat - view.lat) * view.ppd];
+const toLL = (x, y) => [view.lat - (y - H / 2) / view.ppd, view.lon + (x - W / 2) / (view.ppd * K())];
+function fit() {
+  if (!W) return;
+  const latSpan = 8.4, lonSpan = 10.6;
+  view.lat = 33.15; view.lon = 43.75;
+  view.ppd = Math.min(H / latSpan, W / (lonSpan * Math.cos(view.lat * Math.PI / 180))) * 0.98;
+}
+function resize() {
+  const r = $("#scope").getBoundingClientRect();
+  if (!r.width) return;
+  DPR = Math.min(2, window.devicePixelRatio || 1);
+  const first = !W;
+  W = r.width; H = r.height;
+  cv.width = Math.round(W * DPR); cv.height = Math.round(H * DPR);
+  if (first) fit();
+  draw();
+}
+const C = { scope: "#0B131A", land: "#0F1B24", grid: "#15232D", gridTxt: "#4C6170", ring: "#21313C", border: "#C9A24A",
+  city: "#7D919E", target: "#D3E6EC", prm: "#6E8796", red: "#E5484D", gold: "#E2C67C", panel: "rgba(11,19,26,.82)" };
+function plane(x, y, hdg, size, fill, hollow) {
+  ctx.save(); ctx.translate(x, y); ctx.rotate((hdg || 0) * Math.PI / 180); ctx.scale(size / 60, size / 60);
+  ctx.beginPath();
+  ctx.moveTo(0, -30); ctx.bezierCurveTo(3, -30, 5, -24, 5, -18); ctx.lineTo(5, -6); ctx.lineTo(30, 10); ctx.lineTo(30, 15);
+  ctx.lineTo(5, 8); ctx.lineTo(4, 20); ctx.lineTo(12, 27); ctx.lineTo(12, 30); ctx.lineTo(0, 27); ctx.lineTo(-12, 30);
+  ctx.lineTo(-12, 27); ctx.lineTo(-4, 20); ctx.lineTo(-5, 8); ctx.lineTo(-30, 15); ctx.lineTo(-30, 10); ctx.lineTo(-5, -6);
+  ctx.lineTo(-5, -18); ctx.bezierCurveTo(-5, -24, -3, -30, 0, -30); ctx.closePath();
+  if (hollow) { ctx.lineWidth = 2.4 * 60 / size; ctx.strokeStyle = fill; ctx.stroke(); } else { ctx.fillStyle = fill; ctx.fill(); }
+  ctx.restore();
+}
+let hitList = [];
+function draw() {
+  if (!W || state.view !== "scope") return;
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  ctx.fillStyle = C.scope; ctx.fillRect(0, 0, W, H);
+  const b = state.boot;
+  // graticule
+  const [latTop, lonLeft] = toLL(0, 0), [latBot, lonRight] = toLL(W, H);
+  const step = view.ppd > 160 ? 0.5 : 1;
+  ctx.lineWidth = 1; ctx.strokeStyle = C.grid; ctx.fillStyle = C.gridTxt; ctx.font = `10.5px "IBM Plex Mono", monospace`;
+  ctx.beginPath();
+  for (let la = Math.ceil(latBot / step) * step; la <= latTop; la += step) { const [, y] = toXY(la, 0); ctx.moveTo(0, Math.round(y) + .5); ctx.lineTo(W, Math.round(y) + .5); }
+  for (let lo = Math.ceil(lonLeft / step) * step; lo <= lonRight; lo += step) { const [x] = toXY(0, lo); ctx.moveTo(Math.round(x) + .5, 0); ctx.lineTo(Math.round(x) + .5, H); }
+  ctx.stroke();
+  ctx.textBaseline = "top";
+  for (let la = Math.ceil(latBot / step) * step; la <= latTop; la += step) { const [, y] = toXY(la, 0); if (y > 50 && y < H - 60) ctx.fillText(`${la.toFixed(step < 1 ? 1 : 0)}N`, 4, y + 2); }
+  for (let lo = Math.ceil(lonLeft / step) * step; lo <= lonRight; lo += step) { const [x] = toXY(0, lo); if (x > 30 && x < W - 60) ctx.fillText(`${lo.toFixed(step < 1 ? 1 : 0)}E`, x + 3, H - 14); }
+  if (!b) return;
+  // monitored perimeter (union of the three query circles)
+  ctx.save(); ctx.setLineDash([2, 5]); ctx.strokeStyle = C.ring; ctx.lineWidth = 1;
+  for (const [la, lo] of b.circles) { const [x, y] = toXY(la, lo); ctx.beginPath(); ctx.ellipse(x, y, b.radius_nm / 60 * view.ppd * K() / Math.cos(la * Math.PI / 180), b.radius_nm / 60 * view.ppd, 0, 0, Math.PI * 2); ctx.stroke(); }
+  ctx.restore();
+  // Iraq
+  ctx.beginPath();
+  b.border.forEach(([la, lo], i) => { const [x, y] = toXY(la, lo); i ? ctx.lineTo(x, y) : ctx.moveTo(x, y); });
+  ctx.closePath(); ctx.fillStyle = C.land; ctx.fill(); ctx.lineWidth = 1.4; ctx.strokeStyle = C.border; ctx.globalAlpha = .9; ctx.stroke(); ctx.globalAlpha = 1;
+  // range rings around Baghdad
+  const [bx, by] = toXY(33.31, 44.37);
+  ctx.save(); ctx.strokeStyle = C.ring; ctx.fillStyle = C.gridTxt; ctx.setLineDash([1, 4]);
+  for (const nm of [50, 100, 150, 200]) {
+    const ry = nm / 60 * view.ppd, rx = ry * K() / Math.cos(33.31 * Math.PI / 180); ctx.beginPath(); ctx.ellipse(bx, by, rx, ry, 0, 0, Math.PI * 2); ctx.stroke();
+  }
+  ctx.restore();
+  // cities
+  ctx.font = `${lang === "ar" ? "11.5px \"IBM Plex Sans Arabic\"" : "11px \"Saira Semi Condensed\""}, sans-serif`;
+  ctx.textBaseline = "middle";
+  const cityBoxes = [];
+  for (const c of b.cities) {
+    if (view.ppd < 55 && !["Baghdad", "Basra", "Mosul", "Erbil"].includes(c.en)) continue;
+    const [x, y] = toXY(c.lat, c.lon); if (x < -20 || x > W + 20 || y < -20 || y > H + 20) continue;
+    ctx.fillStyle = C.city; ctx.fillRect(x - 1.5, y - 1.5, 3, 3);
+    const name = lang === "ar" ? c.ar : c.en;
+    ctx.fillText(name, x + 6, y);
+    cityBoxes.push([x - 3, y - 8, ctx.measureText(name).width + 12, 16]);
+  }
+  // targets
+  hitList = [];
+  const live = state.live; if (!live) return drawScale();
+  const targets = live.targets.filter(t => (t.st === "PRM" ? state.layers.prm : state.layers.iraq) || t.emg);
+  const boxes = cityBoxes.slice();
+  const dense = targets.length > 45 && view.ppd < 110;
+  ctx.font = `10.5px "IBM Plex Mono", monospace`; ctx.textBaseline = "alphabetic";
+  // Selected target first, then Iraq, then perimeter: earlier ones get the clearest label spot.
+  const order = targets.slice().sort((a, b2) => (b2.id === state.selected) - (a.id === state.selected) || (a.st === "PRM") - (b2.st === "PRM"))
+    .map(t => { const p = project(t); const [x, y] = toXY(p.lat, p.lon); return { t, p, x, y }; })
+    .filter(o => o.x > -40 && o.x < W + 40 && o.y > -40 && o.y < H + 40);
+  for (const o of order) boxes.push([o.x - 9, o.y - 9, 18, 18]);   // labels never cover an aircraft
+  for (const { t, p, x, y } of order) {
+    const col = t.emg ? C.red : t.st === "PRM" ? C.prm : C.target;
+    // history dots
+    if (t.trail && t.trail.length > 1) {
+      ctx.beginPath(); t.trail.forEach(([la, lo], i) => { const [tx, ty] = toXY(la, lo); i ? ctx.lineTo(tx, ty) : ctx.moveTo(tx, ty); }); ctx.lineTo(x, y);
+      ctx.strokeStyle = col; ctx.globalAlpha = .22; ctx.lineWidth = 1; ctx.stroke();
+      t.trail.forEach(([la, lo], i, arr) => { const [tx, ty] = toXY(la, lo); ctx.globalAlpha = .25 + .45 * (i + 1) / arr.length; ctx.fillStyle = col; ctx.fillRect(tx - 1.5, ty - 1.5, 3, 3); });
+      ctx.globalAlpha = 1;
+    }
+    // velocity leader: where the aircraft will be in 2 minutes
+    if (t.gs && t.hdg != null) {
+      const nm = t.gs * 120 / 3600, r = t.hdg * Math.PI / 180;
+      const [vx, vy] = toXY(p.lat + nm * Math.cos(r) / 60, p.lon + nm * Math.sin(r) / (60 * Math.cos(p.lat * Math.PI / 180)));
+      ctx.strokeStyle = col; ctx.globalAlpha = .55; ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(vx, vy); ctx.stroke(); ctx.globalAlpha = 1;
+    }
+    const sel = t.id === state.selected;
+    plane(x, y, t.hdg, sel ? 17 : 13, col, p.coast);
+    hitList.push({ id: t.id, x, y });
+    if (sel) {
+      ctx.strokeStyle = C.gold; ctx.lineWidth = 1.4; const s = 13;
+      ctx.beginPath();
+      [[-1, -1], [1, -1], [1, 1], [-1, 1]].forEach(([sx, sy]) => { ctx.moveTo(x + sx * s, y + sy * (s - 5)); ctx.lineTo(x + sx * s, y + sy * s); ctx.lineTo(x + sx * (s - 5), y + sy * s); });
+      ctx.stroke();
+    }
+    // data block
+    if (!state.labels && !sel) continue;
+    const lines = dense && !sel ? [t.cs] : [t.cs, `${fl(t.alt)} ${t.gs == null ? "" : Math.round(t.gs)}`, sel || !dense ? (t.type || "") + (p.coast ? " ~" : "") : ""].filter(Boolean);
+    const bw = Math.max(...lines.map(l => ctx.measureText(l).width)) + 6, bh = lines.length * 12 + 3;
+    const hits = (lx, ly) => boxes.some(o => lx < o[0] + o[2] && lx + bw > o[0] && ly < o[1] + o[3] && ly + bh > o[1]);
+    const spots = [[x + 16, y - 16 - bh], [x - 16 - bw, y - 16 - bh], [x + 16, y + 16], [x - 16 - bw, y + 16]]
+      .filter(([sx, sy]) => sx > 2 && sx + bw < W - 2 && sy > 2 && sy + bh < H - 2);
+    let spot = spots.find(([sx, sy]) => !hits(sx, sy));
+    if (!spot) { if (!sel) continue; spot = spots[0] || [x + 16, y + 16]; }
+    const [lx, ly] = spot;
+    boxes.push([lx, ly, bw, bh]);
+    ctx.strokeStyle = col; ctx.globalAlpha = .6; ctx.beginPath(); ctx.moveTo(x + (lx > x ? 6 : -6), y + (ly > y ? 6 : -6)); ctx.lineTo(lx > x ? lx : lx + bw, ly > y ? ly : ly + bh); ctx.stroke(); ctx.globalAlpha = 1;
+    if (sel) { ctx.fillStyle = C.panel; ctx.fillRect(lx - 1, ly - 1, bw + 2, bh + 2); }
+    lines.forEach((l, i) => { ctx.fillStyle = i === 0 ? (sel ? C.gold : col) : (t.emg ? C.red : C.city); ctx.fillText(l, lx + 3, ly + 12 + i * 12); });
+  }
+  drawScale();
+}
+function drawScale() {
+  const nmPer80 = 80 / view.ppd * 60;
+  const nice = [5, 10, 20, 25, 50, 100, 200, 250].find(v => v >= nmPer80 * .6) || 250;
+  const px = nice / 60 * view.ppd;
+  $("#scalebar").style.width = px + "px";
+  $("#scaletxt").textContent = `${nice} NM`;
+  $("#rings").textContent = T().rings;
+}
+function centerTxt() { $("#coords").textContent = `${view.lat.toFixed(2)}N ${view.lon.toFixed(2)}E`; }
+
+/* pan, pinch, tap */
+const pointers = new Map(); let gesture = null;
+cv.addEventListener("pointerdown", e => { cv.setPointerCapture(e.pointerId); pointers.set(e.pointerId, { x: e.offsetX, y: e.offsetY });
+  if (pointers.size === 1) gesture = { mode: "pan", x: e.offsetX, y: e.offsetY, lat: view.lat, lon: view.lon, moved: false };
+  else if (pointers.size === 2) { const [a, b] = [...pointers.values()]; gesture = { mode: "pinch", d: Math.hypot(a.x - b.x, a.y - b.y), ppd: view.ppd, moved: true }; } });
+cv.addEventListener("pointermove", e => { if (!pointers.has(e.pointerId)) return; pointers.set(e.pointerId, { x: e.offsetX, y: e.offsetY });
+  if (!gesture) return;
+  if (gesture.mode === "pan" && pointers.size === 1) {
+    const dx = e.offsetX - gesture.x, dy = e.offsetY - gesture.y;
+    if (Math.hypot(dx, dy) > 6) gesture.moved = true;
+    if (gesture.moved) { view.lat = gesture.lat + dy / view.ppd; view.lon = gesture.lon - dx / (view.ppd * K()); clampView(); draw(); centerTxt(); }
+  } else if (gesture.mode === "pinch" && pointers.size === 2) {
+    const [a, b] = [...pointers.values()]; view.ppd = Math.max(25, Math.min(900, gesture.ppd * Math.hypot(a.x - b.x, a.y - b.y) / gesture.d)); draw();
+  } });
+const endPointer = e => { if (!pointers.has(e.pointerId)) return; pointers.delete(e.pointerId);
+  if (gesture && gesture.mode === "pan" && !gesture.moved && pointers.size === 0) tapAt(e.offsetX, e.offsetY);
+  if (pointers.size === 0) gesture = null; else if (pointers.size === 1) { const [p] = [...pointers.values()]; gesture = { mode: "pan", x: p.x, y: p.y, lat: view.lat, lon: view.lon, moved: true }; } };
+cv.addEventListener("pointerup", endPointer); cv.addEventListener("pointercancel", endPointer);
+cv.addEventListener("wheel", e => { e.preventDefault(); zoomAt(e.deltaY < 0 ? 1.18 : 1 / 1.18, e.offsetX, e.offsetY); }, { passive: false });
+function zoomAt(f, x = W / 2, y = H / 2) {
+  const [la, lo] = toLL(x, y); view.ppd = Math.max(25, Math.min(900, view.ppd * f));
+  const [la2, lo2] = toLL(x, y); view.lat += la - la2; view.lon += lo - lo2; clampView(); draw(); centerTxt();
+}
+function clampView() { view.lat = Math.max(24, Math.min(42, view.lat)); view.lon = Math.max(34, Math.min(54, view.lon)); }
+function tapAt(x, y) {
+  let best = null, bd = 26;
+  for (const h of hitList) { const d = Math.hypot(h.x - x, h.y - y); if (d < bd) { bd = d; best = h; } }
+  state.selected = best ? best.id : null; if (best) haptic("select");
+  draw(); renderPick();
+}
+function renderPick() {
+  const el = $("#pick"); const t = state.live && state.live.targets.find(x => x.id === state.selected);
+  if (!t) { el.hidden = true; return; }
+  const a = ageS(t.seen);
+  el.hidden = false;
+  el.innerHTML = `<div class="info"><div class="cs">${esc(t.cs)}</div>
+    <div class="sub">${esc([t.op, t.type, t.dep && t.arr ? `${t.dep} – ${t.arr}` : t.reg].filter(Boolean).join("   "))}</div>
+    <div class="vals"><span><em>FL</em> ${fl(t.alt)}</span><span><em>GS</em> ${n0(t.gs)}</span><span><em>HDG</em> ${t.hdg == null ? "--" : String(Math.round(t.hdg)).padStart(3, "0")}</span><span><em>${esc(T().age(a))}</em></span></div></div>
+    <button class="open" id="pick-open">${esc(T().open)}</button>`;
+  $("#pick-open").onclick = () => openDossier(t.id);
+}
+
+/* ---------------------------------------------------------------- strips */
+function stripHTML(t) {
+  const a = ageS(t.seen);
+  const code = t.emg ? "EMG" : t.st;
+  return `<button class="strip ${esc(t.st)}${t.emg ? " emg" : ""}" data-id="${t.id}">
+    <span class="code">${esc(code)}</span>
+    <span class="mid"><span class="l1"><span class="cs">${esc(t.cs)}</span><span class="ty">${esc(t.type || "----")}</span></span>
+      <span class="l2">${t.dep && t.arr ? `<span class="rt">${esc(t.dep)} – ${esc(t.arr)}</span>&nbsp;&nbsp;` : ""}${esc(t.op || t.reg || "")}</span></span>
+    <span class="end"><b>FL${fl(t.alt)}</b><span>${n0(t.gs)} kt  ${esc(T().age(a))}</span></span></button>`;
+}
+function renderStrips() {
+  document.querySelectorAll("#strip-seg button").forEach(b => b.setAttribute("aria-pressed", !state.results && b.dataset.f === state.filter));
+  const list = $("#strip-list");
+  if (state.results) {
+    $("#strip-count").textContent = T().results(state.results.length);
+    list.innerHTML = state.results.length ? state.results.map(stripHTML).join("") : `<div class="empty">${esc(T().noRes)}</div>`;
+    return;
+  }
+  const all = state.live ? state.live.targets : [];
+  const rows = all.filter(t => state.filter === "emg" ? t.emg : state.filter === "prm" ? t.st === "PRM" : t.st !== "PRM")
+    .sort((a, b) => (b.emg - a.emg) || a.cs.localeCompare(b.cs));
+  $("#strip-count").textContent = T().shown(rows.length);
+  list.innerHTML = rows.length ? rows.map(stripHTML).join("") : `<div class="empty">${esc(T().noLive)}</div>`;
+}
+
+/* ---------------------------------------------------------------- dossier */
+const kv = rows => `<dl class="kv">${rows.filter(r => r && r[1] != null && r[1] !== "").map(([k, v]) => `<div><dt>${esc(k)}</dt><dd>${v}</dd></div>`).join("")}</dl>`;
+function altChart(track) {
+  const pts = track.filter(p => p[3] != null);
+  if (pts.length < 3) return "";
+  const w = 600, h = 150, pl = 44, pr = 10, pt = 12, pb = 24;
+  const t0 = Date.parse(pts[0][0]), t1 = Date.parse(pts[pts.length - 1][0]) || t0 + 1;
+  const amax = Math.max(...pts.map(p => p[3])), top = Math.max(1000, Math.ceil(amax / 5000) * 5000);
+  const X = t => pl + (w - pl - pr) * ((Date.parse(t) - t0) / Math.max(1, t1 - t0));
+  const Y = a => pt + (h - pt - pb) * (1 - a / top);
+  const d = pts.map((p, i) => `${i ? "L" : "M"}${X(p[0]).toFixed(1)} ${Y(p[3]).toFixed(1)}`).join("");
+  const ticks = [0, top / 2, top].map(a => `<line x1="${pl}" x2="${w - pr}" y1="${Y(a)}" y2="${Y(a)}" stroke="#1F2E39"/><text x="${pl - 6}" y="${Y(a) + 4}" text-anchor="end" fill="#6A7E8B" font-size="11" font-family="IBM Plex Mono, monospace">${a ? "FL" + fl(a) : "0"}</text>`).join("");
+  const xl = [pts[0], pts[pts.length - 1]].map((p, i) => `<text x="${X(p[0])}" y="${h - 6}" text-anchor="${i ? "end" : "start"}" fill="#6A7E8B" font-size="11" font-family="IBM Plex Mono, monospace">${fmtTime(p[0])}</text>`).join("");
+  return `<div class="figure" id="altfig"><svg viewBox="0 0 ${w} ${h}" role="img" aria-label="${esc(T().altProfile)}">${ticks}${xl}
+    <path d="${d}" fill="none" stroke="#C9A24A" stroke-width="2" stroke-linejoin="round"/>
+    <line id="alt-x" y1="${pt}" y2="${h - pb}" stroke="#97A9B4" stroke-width="1" visibility="hidden"/>
+    <circle id="alt-dot" r="4" fill="#E2C67C" stroke="#0F1A22" stroke-width="2" visibility="hidden"/>
+    <rect x="${pl}" y="0" width="${w - pl - pr}" height="${h}" fill="transparent" id="alt-hit"/></svg><div class="tip" id="alt-tip" hidden></div></div>`;
+}
+function bindAltChart(track) {
+  const fig = $("#altfig"); if (!fig) return;
+  const pts = track.filter(p => p[3] != null), svg = fig.querySelector("svg");
+  const w = 600, h = 150, pl = 44, pr = 10, pt = 12, pb = 24;
+  const t0 = Date.parse(pts[0][0]), t1 = Date.parse(pts[pts.length - 1][0]) || t0 + 1;
+  const top = Math.max(1000, Math.ceil(Math.max(...pts.map(p => p[3])) / 5000) * 5000);
+  const move = e => {
+    const r = svg.getBoundingClientRect(), vx = (e.clientX - r.left) / r.width * w;
+    const tt = t0 + (vx - pl) / (w - pl - pr) * (t1 - t0);
+    let best = pts[0]; for (const p of pts) if (Math.abs(Date.parse(p[0]) - tt) < Math.abs(Date.parse(best[0]) - tt)) best = p;
+    const x = pl + (w - pl - pr) * ((Date.parse(best[0]) - t0) / Math.max(1, t1 - t0)), y = pt + (h - pt - pb) * (1 - best[3] / top);
+    $("#alt-x").setAttribute("x1", x); $("#alt-x").setAttribute("x2", x); $("#alt-x").setAttribute("visibility", "visible");
+    $("#alt-dot").setAttribute("cx", x); $("#alt-dot").setAttribute("cy", y); $("#alt-dot").setAttribute("visibility", "visible");
+    const tip = $("#alt-tip"); tip.hidden = false; tip.style.left = (x / w * r.width) + "px"; tip.style.top = (y / h * r.height) + "px";
+    tip.textContent = `${fmtTime(best[0])}  FL${fl(best[3])}${best[4] != null ? "  " + Math.round(best[4]) + " kt" : ""}`;
+  };
+  const leave = () => { $("#alt-tip").hidden = true; $("#alt-x").setAttribute("visibility", "hidden"); $("#alt-dot").setAttribute("visibility", "hidden"); };
+  svg.addEventListener("pointermove", move); svg.addEventListener("pointerdown", move); svg.addEventListener("pointerleave", leave);
+}
+function trackMap(f) {
+  const pts = f.track; if (!pts.length || !state.boot) return "";
+  const lats = pts.map(p => p[1]), lons = pts.map(p => p[2]);
+  let la0 = Math.min(...lats), la1 = Math.max(...lats), lo0 = Math.min(...lons), lo1 = Math.max(...lons);
+  const pad = Math.max(.6, (la1 - la0) * .25, (lo1 - lo0) * .2); la0 -= pad; la1 += pad; lo0 -= pad; lo1 += pad;
+  const w = 600, h = 260, k = Math.cos((la0 + la1) / 2 * Math.PI / 180);
+  const s = Math.min(h / (la1 - la0), w / ((lo1 - lo0) * k));
+  const cx = (lo0 + lo1) / 2, cy = (la0 + la1) / 2;
+  const P = (la, lo) => [(w / 2 + (lo - cx) * s * k).toFixed(1), (h / 2 - (la - cy) * s).toFixed(1)];
+  const border = state.boot.border.map(([la, lo], i) => (i ? "L" : "M") + P(la, lo).join(" ")).join("") + "Z";
+  const line = pts.map((p, i) => (i ? "L" : "M") + P(p[1], p[2]).join(" ")).join("");
+  const dots = pts.map(p => { const [x, y] = P(p[1], p[2]); return `<rect x="${x - 2}" y="${y - 2}" width="4" height="4" fill="${p[6] ? "#E2C67C" : "#6E8796"}"/>`; }).join("");
+  const last = pts[pts.length - 1], [lx, ly] = P(last[1], last[2]);
+  const cities = state.boot.cities.filter(c => c.lat > la0 && c.lat < la1 && c.lon > lo0 && c.lon < lo1)
+    .map(c => { const [x, y] = P(c.lat, c.lon); return `<rect x="${x - 1.5}" y="${y - 1.5}" width="3" height="3" fill="#7D919E"/><text x="${+x + 6}" y="${+y + 4}" fill="#7D919E" font-size="12" font-family="${lang === "ar" ? "IBM Plex Sans Arabic" : "Saira Semi Condensed"}, sans-serif">${esc(lang === "ar" ? c.ar : c.en)}</text>`; }).join("");
+  return `<div class="figure"><svg viewBox="0 0 ${w} ${h}" role="img" aria-label="${esc(T().trackMap)}"><rect width="${w}" height="${h}" fill="#0B131A"/>
+    <path d="${border}" fill="#0F1B24" stroke="#C9A24A" stroke-width="1.2" opacity=".9"/>${cities}
+    <path d="${line}" fill="none" stroke="#C9A24A" stroke-width="1.5" opacity=".55"/>${dots}
+    <path transform="translate(${lx} ${ly}) rotate(${f.heading || 0}) scale(.32)" fill="#D3E6EC" d="M0-30C3-30 5-24 5-18L5-6L30 10L30 15L5 8L4 20L12 27L12 30L0 27L-12 30L-12 27L-4 20L-5 8L-30 15L-30 10L-5-6L-5-18C-5-24-3-30 0-30Z"/></svg></div>`;
+}
+async function openDossier(id) {
+  haptic();
+  state.dossierId = id;
+  const d = $("#dossier"); d.hidden = false; requestAnimationFrame(() => d.classList.add("open"));
+  $("#d-head").innerHTML = `<div><div class="cs">…</div></div>`; $("#d-body").innerHTML = "";
+  if (ver("6.1")) { tg.BackButton.show(); }
+  try { renderDossier(await api(`/api/flight/${id}`)); } catch (e) { closeDossier(); handleErr(e); }
+}
+function closeDossier() {
+  const d = $("#dossier"); d.classList.remove("open"); state.dossierId = null;
+  setTimeout(() => { if (!state.dossierId) d.hidden = true; }, 240);
+  if (ver("6.1")) tg.BackButton.hide();
+}
+function renderDossier(f) {
+  const t = T(), na = null;
+  const ac = f.aircraft || {};
+  const ap = (p) => ({ code: f[p + "_iata"] || f[p + "_icao"], full: [f[p + "_iata"], f[p + "_icao"]].filter(Boolean).join(" / "), city: f[p + "_city"] || f[p + "_name"], cc: f[p + "_country"] });
+  const dep = ap("dep"), arr = ap("arr");
+  const chipCls = f.st === "1OB" ? "OB" : f.st;
+  $("#d-head").innerHTML = `<div><div class="cs">${esc(f.cs)}</div><div class="op">${esc([f.airline_name || f.airline_icao, f.flight_number_iata].filter(Boolean).join("   ") || "")}</div></div>
+    <button class="close" id="d-close" aria-label="Close"><svg width="18" height="18" stroke="currentColor" fill="none" stroke-width="1.6"><use href="#i-close"/></svg></button>
+    <div class="status"><span class="chip ${chipCls}">${esc(f.st)}</span><span>${esc(f.status_text)}</span></div>
+    ${f.emg ? `<div class="alert">Squawk ${esc(f.squawk)}: ${esc(f.squawk_text || "")}</div>` : ""}`;
+  $("#d-close").onclick = closeDossier;
+  let html = "";
+  // route
+  if (dep.code && arr.code) {
+    const pr = f.progress;
+    html += `<div class="route"><div class="ap"><b>${esc(dep.code)}</b><span>${esc([dep.city, dep.cc].filter(Boolean).join(", "))}</span></div>
+      <div class="track-bar">${pr ? `<div class="done" style="width:${pr.pct}%"></div><svg style="left:${pr.pct}%" viewBox="-32 -32 64 64"><path transform="rotate(90)" d="M0-30C3-30 5-24 5-18L5-6L30 10L30 15L5 8L4 20L12 27L12 30L0 27L-12 30L-12 27L-4 20L-5 8L-30 15L-30 10L-5-6L-5-18C-5-24-3-30 0-30Z"/></svg>` : ""}</div>
+      <div class="ap"><b>${esc(arr.code)}</b><span>${esc([arr.city, arr.cc].filter(Boolean).join(", "))}</span></div></div>`;
+    if (pr) html += kv([[t.flown, `${n0(pr.flown)} <small>NM</small>`], [t.remaining, `${n0(pr.remaining)} <small>NM</small>`],
+      pr.eta ? [t.eta, `${fmtTime(pr.eta, true)} <small>${pr.pct}%</small>`] : null]);
+  }
+  html += `<p class="note">${esc(f.route_source ? t.routeSrc(f.route_source) : f.route_checked_utc ? t.routeNone : t.routePending)}</p>`;
+  // telemetry
+  html += `<h2>${esc(t.telemetry)}</h2>`;
+  const vr = f.vertical_rate == null ? null : Math.abs(f.vertical_rate) < 100 ? esc(t.level) : `${f.vertical_rate > 0 ? "+" : "-"}${n0(Math.abs(f.vertical_rate))} <small>ft/min</small>`;
+  html += kv([
+    [t.alt, f.altitude_ft == null ? "--" : `${n0(f.altitude_ft)} <small>ft  FL${fl(f.altitude_ft)}</small>`],
+    [t.gs, f.ground_speed_kt == null ? "--" : `${n0(f.ground_speed_kt)} <small>kt  ${n0(f.ground_speed_kt * 1.852)} km/h</small>`],
+    [t.hdg, f.heading == null ? "--" : `${String(Math.round(f.heading)).padStart(3, "0")}° <small>${esc(f.compass || "")}</small>`],
+    [t.vr, vr],
+    [t.galt, f.alt_geom_ft == null ? na : `${n0(f.alt_geom_ft)} <small>ft</small>`],
+    [t.sq, f.squawk ? `${esc(f.squawk)}${f.squawk_text ? ` <small>${esc(f.squawk_text)}</small>` : ""}` : na],
+    [t.mach, f.mach == null ? na : f.mach.toFixed(3)],
+    [t.ias, f.ias_kt == null && f.tas_kt == null ? na : `${n0(f.ias_kt)} / ${n0(f.tas_kt)} <small>kt</small>`],
+    [t.selalt, f.nav_altitude_ft == null ? na : `${n0(f.nav_altitude_ft)} <small>ft</small>`],
+    [t.selhdg, f.nav_heading == null ? na : `${String(Math.round(f.nav_heading)).padStart(3, "0")}°`],
+    [t.wind, f.wind_dir == null || f.wind_kt == null ? na : `${String(Math.round(f.wind_dir)).padStart(3, "0")}° / ${n0(f.wind_kt)} <small>kt</small>`],
+    [t.oat, f.oat_c == null ? na : `${n0(f.oat_c)} <small>°C</small>`],
+    [t.pos, f.latitude == null ? na : `${f.latitude.toFixed(3)}, ${f.longitude.toFixed(3)}`],
+    [t.near, f.near ? esc(f.near) : na],
+    [t.src, f.pos_source ? esc(f.pos_source) : na],
+    [t.seen, `${fmtTime(f.last_seen_utc, true)} <small>${esc(t.age(ageS(f.last_seen_utc)))}</small>`],
+  ]);
+  if (f.track && f.track.length) { html += `<h2>${esc(t.trackMap)}</h2>` + trackMap(f); }
+  const prof = altChart(f.track || []); if (prof) html += `<h2>${esc(t.altProfile)}</h2>` + prof;
+  // Iraq airspace
+  if (f.st === "CNF" || f.st === "1OB") {
+    const mins = f.obs_count >= 2 ? Math.max(1, Math.floor((Date.parse(f.last_seen_utc) - Date.parse(f.first_seen_utc)) / 60000)) : null;
+    html += `<h2>${esc(t.iraqAir)}</h2>` + kv([[t.first, fmtTime(f.first_seen_utc, true)], [t.last, fmtTime(f.last_seen_utc, true)],
+      [t.dur, mins ? esc(t.durVal(mins)) : esc(t.durNa)], [t.obs, n0(f.obs_count)],
+      f.traffic ? [t.traffic, esc(f.traffic)] : null]);
+  }
+  // aircraft
+  html += `<h2>${esc(t.aircraft)}</h2>` + kv([
+    [t.reg, esc(f.registration || ac.registration || "--")], [t.hex, esc(f.mode_s || "--")],
+    [t.type, esc(f.aircraft_type || ac.type_icao || "--")], [t.model, esc(ac.type_desc || f.aircraft_type_desc || "") || na],
+    [t.maker, ac.manufacturer ? esc(ac.manufacturer) : na], [t.owner, ac.operator_name ? esc(ac.operator_name) : na],
+    [t.country, ac.owner_country || f.origin_country ? esc(ac.owner_country || f.origin_country) : na],
+    [t.cat, f.category ? `${esc(f.category)} <small>${esc(f.category_text || "")}</small>` : na],
+  ]);
+  if (f.recent && f.recent.length) {
+    html += `<h2>${esc(t.recent)}</h2><div class="recent">` + f.recent.map(r => `<button data-id="${r.id}"><span class="chip ${r.st === "1OB" ? "OB" : esc(r.st)}">${esc(r.st)}</span><span><b>${esc(r.cs)}</b> <span class="rt">${esc(r.route || "")}</span></span><time>${fmtTime(r.seen, true)}</time></button>`).join("") + `</div>`;
+  }
+  html += `<div class="row-btns"><button class="btn ${f.watching ? "on" : "primary"}" id="d-watch">${esc(f.watching ? t.watching : t.watch)}</button>` +
+    (f.latitude != null ? `<button class="btn" id="d-map">${esc(t.map)}</button>` : "") + `</div>`;
+  if (ac.photo_url && /^https:\/\//.test(ac.photo_url)) html += `<div class="row-btns" style="grid-template-columns:1fr"><button class="btn" id="d-photo">${esc(t.photo)}</button></div>`;
+  html += `<p class="note">${esc(t.times)}</p><div class="foot-meta">REC ${String(f.id).padStart(6, "0")}   SRC ${esc(f.data_source || "-")}   UPD ${fmtTime(f.updated_utc, true)}</div>`;
+  $("#d-body").innerHTML = html; $("#d-body").scrollTop = 0;
+  bindAltChart(f.track || []);
+  $("#d-body").querySelectorAll(".recent button").forEach(b => b.onclick = () => openDossier(+b.dataset.id));
+  $("#d-watch").onclick = async () => {
+    try { const r = await api("/api/watch", { method: "POST", body: JSON.stringify({ id: f.id }) });
+      f.watching = r.watching; haptic("ok"); renderDossier(f);
+    } catch (e) { haptic("err"); if (e.status === 409) { if (tg && tg.showAlert && ver("6.2")) tg.showAlert(t.watchFull); } else handleErr(e); }
+  };
+  if ($("#d-map")) $("#d-map").onclick = () => openLink(`https://www.google.com/maps?q=${f.latitude.toFixed(4)},${f.longitude.toFixed(4)}`);
+  if ($("#d-photo")) $("#d-photo").onclick = () => openLink(ac.photo_url);
+}
+
+/* ---------------------------------------------------------------- traffic */
+function rankTable(rows, noCode) {
+  if (!rows.length) return `<div class="empty">${esc(T().noStats)}</div>`;
+  const top = rows[0].n || 1;
+  return `<table class="rank"><tbody>${rows.map(r => `<tr>${noCode ? "" : `<td class="c">${esc(r.code || "--")}</td>`}<td class="nm">${esc(r.name || r.label || "")}</td><td class="b"><div class="bar-in" style="width:${Math.max(2, r.n / top * 100)}%"></div></td><td class="n">${n0(r.n)}</td></tr>`).join("")}</tbody></table>`;
+}
+function hourChart(hours) {
+  const w = 600, h = 170, pl = 30, pr = 6, pt = 14, pb = 22, max = Math.max(1, ...hours);
+  const bw = (w - pl - pr) / 24, gap = 2;
+  const top = max <= 4 ? 4 : Math.ceil(max / 4) * 4;
+  const Y = v => pt + (h - pt - pb) * (1 - v / top);
+  const grid = [0, top / 2, top].map(v => `<line x1="${pl}" x2="${w - pr}" y1="${Y(v)}" y2="${Y(v)}" stroke="#1F2E39"/><text x="${pl - 6}" y="${Y(v) + 4}" text-anchor="end" font-size="11" fill="#6A7E8B" font-family="IBM Plex Mono, monospace">${v}</text>`).join("");
+  const bars = hours.map((v, i) => { const x = pl + i * bw + gap / 2, y = Y(v), bh = (h - pb) - y;
+    return `<g data-h="${i}" data-v="${v}">${v ? `<path d="M${x} ${h - pb}V${y + Math.min(4, bh)}Q${x} ${y} ${x + Math.min(4, (bw - gap) / 2)} ${y}H${x + bw - gap - Math.min(4, (bw - gap) / 2)}Q${x + bw - gap} ${y} ${x + bw - gap} ${y + Math.min(4, bh)}V${h - pb}Z" fill="#C9A24A"/>` : ""}<rect x="${x - gap / 2}" y="${pt}" width="${bw}" height="${h - pt - pb}" fill="transparent"/></g>`; }).join("");
+  const xl = [0, 6, 12, 18, 23].map(i => `<text x="${pl + i * bw + bw / 2}" y="${h - 6}" text-anchor="middle" font-size="11" fill="#6A7E8B" font-family="IBM Plex Mono, monospace">${String(i).padStart(2, "0")}</text>`).join("");
+  return `<div class="figure" id="hourfig" style="direction:ltr"><svg viewBox="0 0 ${w} ${h}" role="img" aria-label="hourly">${grid}${bars}${xl}</svg><div class="tip" hidden></div></div>`;
+}
+async function loadTraffic() {
+  const el = $("#traffic"), t = T();
+  const periods = [1, 7, 30, 0];
+  el.innerHTML = `<div class="seg" id="per">${periods.map((p, i) => `<button data-p="${p}" aria-pressed="${state.period === p}">${esc(t.period[i])}</button>`).join("")}</div><div id="tr-body"><p class="count">…</p></div><div class="credit-space"></div>`;
+  el.querySelectorAll("#per button").forEach(b => b.onclick = () => { state.period = +b.dataset.p; haptic("select"); loadTraffic(); });
+  let s; try { s = await api(`/api/stats?days=${state.period}`); } catch (e) { return handleErr(e); }
+  const pct = (a) => s.confirmed ? Math.round(100 * a / s.confirmed) + "%" : "--";
+  let html = `<div class="tiles"><div class="lead"><b>${n0(s.confirmed)}</b><span>${esc(t.confirmed)}</span></div><div><b>${n0(s.single)}</b><span>${esc(t.single)}</span></div>
+    <div><b>${n0(s.airlines)}</b><span>${esc(t.ops)}</span></div><div><b>${n0(s.types)}</b><span>${esc(t.types)}</span></div></div>`;
+  if (s.confirmed) {
+    html += `<h2>${esc(t.hourly(state.boot.tz))}</h2>` + hourChart(s.hours);
+    html += `<h2>${esc(t.mix)}</h2>` + rankTable(s.mix.map(m => ({ label: m.label, n: m.n })), true);
+    html += `<h2>${esc(t.topOps)}</h2>` + rankTable(s.top_airlines) + `<h2>${esc(t.topTypes)}</h2>` + rankTable(s.top_types);
+    html += `<h2>${esc(t.topDep)}</h2>` + rankTable(s.top_dep) + `<h2>${esc(t.topArr)}</h2>` + rankTable(s.top_arr);
+    html += `<h2>${esc(t.avgAlt)}</h2>` + kv([[t.avgAlt, s.avg_alt == null ? "--" : `${n0(s.avg_alt)} <small>ft</small>`], [t.avgGs, s.avg_gs == null ? "--" : `${n0(s.avg_gs)} <small>kt</small>`],
+      [t.complete, `${esc(t.fAirline)} ${pct(s.complete.airline)}`], ["", `${esc(t.fType)} ${pct(s.complete.type)}  ${esc(t.fRoute)} ${pct(s.complete.route)}`]]);
+  } else html += `<div class="empty" style="margin-top:14px">${esc(t.noStats)}</div>`;
+  if (s.coverage) html += `<p class="note">${esc(t.coverage(fmtTime(s.coverage, true).split(",")[0]))}</p>`;
+  $("#tr-body").innerHTML = html;
+  const fig = $("#hourfig");
+  if (fig) { const tip = fig.querySelector(".tip"), svg = fig.querySelector("svg");
+    fig.querySelectorAll("g[data-h]").forEach(g => { const on = () => { const r = svg.getBoundingClientRect(), bb = g.getBBox();
+      tip.hidden = false; tip.style.left = ((bb.x + bb.width / 2) / 600 * r.width) + "px"; tip.style.top = "26px";
+      tip.textContent = `${String(g.dataset.h).padStart(2, "0")}:00  ${g.dataset.v}`; };
+      g.addEventListener("pointerenter", on); g.addEventListener("pointerdown", on); });
+    svg.addEventListener("pointerleave", () => tip.hidden = true); }
+}
+
+/* ---------------------------------------------------------------- system */
+async function loadSystem() {
+  const el = $("#system"), t = T();
+  let s; try { s = await api("/api/system"); } catch (e) { return handleErr(e); }
+  const up = s.uptime_s, upTxt = `${Math.floor(up / 86400)}d ${Math.floor(up % 86400 / 3600)}h ${Math.floor(up % 3600 / 60)}m`;
+  let html = kv([[t.feed, `<span class="${s.feed === "OK" ? "ok" : "bad"}">${esc(s.feed || "--")}</span>`], [t.version, esc(s.version)],
+    [t.uptime, upTxt], [t.interval, `${s.interval} <small>s</small>`], [t.next, s.next ? fmtTime(s.next) : "--"],
+    [t.sources, esc(String(s.sources.length))], [t.stored, n0(s.flights)], [t.points, n0(s.points)]]);
+  if (s.feeds.length) html += `<h2>${esc(t.feeds)}</h2><table class="log"><tbody>${s.feeds.map(x => `<tr><td>${esc(x)}</td></tr>`).join("")}</tbody></table>`;
+  html += `<h2>${esc(t.log)}</h2><table class="log"><thead><tr><th>${esc(t.time)}</th><th>${esc(t.status)}</th><th class="r">${esc(t.recv)}</th><th class="r">${esc(t.inIraq)}</th><th class="r">${esc(t.around)}</th></tr></thead><tbody>` +
+    s.log.map(r => `<tr><td>${fmtTime(r.t)}</td><td class="${r.status === "OK" ? "ok" : "bad"}">${esc(r.status)}</td><td class="r">${r.recv}</td><td class="r">${r.iraq}</td><td class="r">${r.around}</td></tr>`).join("") + `</tbody></table>`;
+  if (s.admin) html += `<h2>${esc(t.admin)}</h2>` + kv([[t.users, n0(s.admin.users)], [t.subCheck, `<span class="${s.admin.sub_check === "OK" ? "ok" : "bad"}">${esc(s.admin.sub_check)}</span>`],
+    [t.lookups, n0(s.admin.lookups)], ["", esc(s.admin.lookup_error || "")]]);
+  html += `<div class="links"><button class="btn" id="s-ch">${esc(t.channel)}  @${esc(state.boot.channel)}</button><button class="btn" id="s-dev">${esc(t.dev)}  @${esc(state.boot.dev)}</button></div>`;
+  el.innerHTML = html;
+  $("#s-ch").onclick = () => openTg(`https://t.me/${state.boot.channel}`);
+  $("#s-dev").onclick = () => openTg(`https://t.me/${state.boot.dev}`);
+}
+
+/* ---------------------------------------------------------------- start */
+let pollTimer = null, tickTimer = null;
+async function start() {
+  setLang(lang);
+  if (!tg || !tg.initData) { gate("notg"); return; }
+  try {
+    tg.ready(); tg.expand();
+    if (ver("6.1")) { tg.setHeaderColor("#0B131A"); tg.setBackgroundColor("#0B131A"); tg.BackButton.onClick(closeDossier); }
+    if (ver("7.10")) tg.setBottomBarColor("#0F1A22");
+    if (ver("7.7")) tg.disableVerticalSwipes();
+  } catch (e) {}
+  gate("boot", 0);
+  try {
+    state.boot = await api("/api/bootstrap");
+    setLang(state.boot.lang); gate("boot", 1);
+    state.live = await api("/api/live"); gate("boot", 2);
+  } catch (e) { return handleErr(e); }
+  applyStatic();
+  $("#gate").hidden = true; $("#app").hidden = false;
+  show(state.view); tick(); centerTxt();
+  clearInterval(pollTimer); clearInterval(tickTimer);
+  pollTimer = setInterval(() => { if (!document.hidden && (state.view === "scope" || state.view === "strips")) loadLive(); }, 20000);
+  tickTimer = setInterval(() => { tick(); if (!document.hidden && state.view === "scope") draw(); }, 1000);
+}
+document.querySelectorAll("nav button").forEach(b => b.onclick = () => { haptic("select"); show(b.dataset.v); });
+$("#ly-iraq").onclick = e => { state.layers.iraq = !state.layers.iraq; e.currentTarget.setAttribute("aria-pressed", state.layers.iraq); draw(); };
+$("#ly-prm").onclick = e => { state.layers.prm = !state.layers.prm; e.currentTarget.setAttribute("aria-pressed", state.layers.prm); draw(); };
+$("#zin").onclick = () => zoomAt(1.4); $("#zout").onclick = () => zoomAt(1 / 1.4);
+$("#zfit").onclick = () => { fit(); draw(); centerTxt(); };
+$("#zlbl").onclick = e => { state.labels = !state.labels; e.currentTarget.setAttribute("aria-pressed", state.labels); draw(); };
+$("#strip-seg").addEventListener("click", e => { const b = e.target.closest("button"); if (!b) return; state.filter = b.dataset.f; state.results = null; $("#q").value = ""; haptic("select"); renderStrips(); });
+$("#strip-list").addEventListener("click", e => { const b = e.target.closest(".strip"); if (b) openDossier(+b.dataset.id); });
+$("#search-form").addEventListener("submit", async e => {
+  e.preventDefault(); const q = $("#q").value.trim(); $("#q").blur();
+  if (q.length < 2) { state.results = null; renderStrips(); return; }
+  $("#strip-count").textContent = T().searching;
+  try { state.results = (await api(`/api/search?q=${encodeURIComponent(q)}`)).results; renderStrips(); } catch (err) { handleErr(err); }
+});
+window.addEventListener("resize", () => { if (state.view === "scope") resize(); });
+document.addEventListener("visibilitychange", () => { if (!document.hidden && state.boot) loadLive(); });
+document.addEventListener("keydown", e => { if (e.key === "Escape" && state.dossierId) closeDossier(); });
+start();
+</script>
+</body>
+</html>
+"""
 
 if __name__ == "__main__":
     sys.exit(asyncio.run(amain()))
